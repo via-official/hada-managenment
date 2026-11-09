@@ -43,7 +43,7 @@ import {
   notionPatchPageProperties,
   createSendLogEntry,
   getBotUserId,
-  getAlimtalkConfig,
+  branchOfRegistration, getAlimtalkConfig,
   getCurrentAdminKey,
   resolveAdminKeyFromRequest,
   extractErrorMessage,
@@ -245,7 +245,7 @@ Deno.serve(async (req) => {
             pfId: SOLAPI_PF_ID_FALLBACK,
             templateId: "",
             senderNumber: SOLAPI_SENDER_NUMBER_FALLBACK,
-          }, chain.fallback.length ? chain.fallback : undefined)
+          }, chain.fallback.length ? chain.fallback : undefined, branchOfRegistration(registrationId))
 
           const variables: Record<string, string> = {
             "#{학생이름}": studentName,

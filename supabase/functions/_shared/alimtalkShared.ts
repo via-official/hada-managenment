@@ -13,7 +13,7 @@ import { fitVariablesToTemplate } from "./templateFit.ts"
 import {
   notionGetPage,
   notionPatchPageProperties,
-  getAlimtalkConfig,
+  branchOfRegistration, getAlimtalkConfig,
   assertValidPhone,
   type AlimtalkRecipientTarget,
   parseTokenValue,
@@ -220,7 +220,7 @@ export async function sendDailyReportAlimtalk(payload: {
     pfId: SOLAPI_PF_ID_FALLBACK,
     templateId: "",
     senderNumber: SOLAPI_SENDER_NUMBER_FALLBACK,
-  }, category === "일일 보고서" ? undefined : "일일 보고서")
+  }, category === "일일 보고서" ? undefined : "일일 보고서", branchOfRegistration(payload.registrationId))
   if (!config.templateId) throw new Error(`템플릿 ID가 설정되지 않았습니다. '알림톡 설정(학원) DB'의 '${category}' 행을 켜고 템플릿 ID를 넣어 주세요.`)
 
   const { SolapiMessageService } = await import("npm:solapi")

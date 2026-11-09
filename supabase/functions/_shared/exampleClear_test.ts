@@ -14,8 +14,8 @@ Deno.test("지울·남길 DB 목록이 PC 스크립트와 같다", async () => {
   assertEquals(KEEP_DBS, pyList(src, "KEEP_DBS"))
 })
 
-Deno.test("남기는 DB는 알림톡 설정·과목과 시스템용 메뉴·웹페이지·학년, 비어 있는 문의·요청뿐", () => {
-  assertEquals([...KEEP_DBS].sort(), ["과목(학원) DB", "메뉴(학원) DB", "문의·요청(학원) DB", "알림톡 설정(학원) DB", "웹페이지(학원) DB", "학년(학원) DB"].sort())
+Deno.test("남기는 DB는 알림톡 설정·소속관·과목과 시스템용 메뉴·웹페이지·학년, 비어 있는 문의·요청뿐", () => {
+  assertEquals([...KEEP_DBS].sort(), ["과목(학원) DB", "메뉴(학원) DB", "문의·요청(학원) DB", "소속관(학원) DB", "알림톡 설정(학원) DB", "웹페이지(학원) DB", "학년(학원) DB"].sort())
   for (const n of KEEP_DBS) assert(!CLEAR_DBS.includes(n))
 })
 
