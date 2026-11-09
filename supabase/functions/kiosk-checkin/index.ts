@@ -1,0 +1,458 @@
+// POST /functions/v1/kiosk-checkin
+// header: x-admin-key: <관리자 키>  (list-students 등 다른 키오스크/관리 화면 함수와 동일한 인증)
+// body: { phone: string, type: "checkin" | "checkout", registrationId?: string }
+//
+// attendance_kiosk.html의 등원/하원 버튼이 호출한다. 예전에는 이 화면이 외부 Make.com 웹훅으로
+// 학생 매칭·출석 기록·알림톡 발송을 위임했는데, 그 경로를 없애고 다른 관리 함수들과 동일하게
+// Notion을 직접 조회/갱신하도록 통합한다 (로드맵: 키오스크 Make 의존 제거, 2026-09-19).
+//
+// [2026-10-05 v2.5.2] 화면의 최소 목록으로 등록 ID를 먼저 받으며 서버에서 현재 소속·수강 상태·학생 연락처를 검증한다.
+// 등록 ID가 없는 구버전/목록 누락 요청만 전체 학생 조회로 보완한다.
+// 매칭: 학생(학원) DB의 학생/어머니/아버지/기타 보호자 연락처 중 하나가 일치하고, 수강 중(🟢)인 등록을 찾는다.
+// 알림 수신 대상이 "우선 연락 대상"이면 등록의 학부모 연락처 롤업(학생의 우선 연락처 원본)을 사용한다.
+// - 매칭이 하나도 없으면 { matched: false }.
+// - 같은 번호로 매칭되는 등록이 여러 건이면(형제/자매가 보호자 번호 공유 등) 검색을 바로 끝내지
+//   않고 { needsSelection: true, candidates: [...] }를 반환한다. 프론트는 사용자가 고른
+//   registrationId를 담아 이 엔드포인트를 다시 호출한다.
+// - 오늘 날짜의 출석 페이지가 있으면 그 페이지에 등원/하원스템프를 기록한다. 이때 "출석 상태"가
+//   이미 "🔵 보강"이면 그대로 두고(정규 수업 없는 날의 방문을 유지), 그 외(기본값/결석 등)는
+//   실제로 등원·하원했으므로 "🟢 출석"으로 갱신한다.
+//   [FIX, 2026-09-19] 원래는 스템프만 찍고 "출석 상태"를 전혀 건드리지 않아서, 정규 수업이 있어
+//   미리 만들어진 출석 페이지가 있어도 키오스크로 등원/하원 처리해도 "출석"으로 바뀌지 않는 버그가
+//   있었다.
+// - 없으면(시험기간 등 정규 수업이 없는 날의 방문) 출석 페이지를 새로 만들고 "출석 상태"를
+//   "🔵 보강"으로 설정한다. 하원인데 등원 기록이 없던 경우엔 하원스템프만 채우고 등원스템프는
+//   비워둔다.
+// - [v2.5.39] 이미 스템프가 있을 때의 처리는 키오스크 설정의 방식(body.mode)을 따른다(_shared/kioskPolicy.ts).
+//   once(1일 1회, 기본): 덮어쓰지 않고 { alreadyDone: true, alreadyAt }로 안내, 알림톡도 다시 보내지 않는다.
+//   every(매번 기록): 새 시각으로 덮어쓰고 알림톡을 보낸다. 두 방식 모두 같은 버튼 2분 안 재입력은
+//   { alreadyDone: true, recent: true }로 무시한다. 아래 FIX 메모는 once 방식의 배경이다.
+//   [FIX, 2026-09-19] 원래는 하원에는 이 중복 방지가 없어서 하원 버튼을 다시 누르면 스템프를
+//   덮어쓰고 알림톡도 매번 다시 발송하는 문제가 있었다. 등원과 동일하게 맞춘다.
+// - 카카오 알림톡: 등원/하원을 별도 템플릿 두 개로 운영하면 Solapi 템플릿 승인을 두 번 받아야 해서
+//   (2026-09-19) "키오스크 알림톡" 코드 하나로 통합했다. "알림톡 설정(학원) DB"에 이 코드 행이
+//   있고 활성화되어 있어야 실제 발송된다. Solapi 템플릿 승인 전(비활성 상태)에는 조용히 건너뛰고,
+//   출결 기록 자체는 항상 정상 동작한다. 템플릿 변수는 학생이름/구분("등원" 또는 "하원")/일자/시간이며,
+//   일자/시간은 각각 "2026년 9월 19일 (토)"/"오전 9시 40분" 형식으로 만들어서 보낸다(2026-09-19 #3,
+//   템플릿 문구에 맞춤).
+// - [FIX, 2026-09-19 #2] "발신번호"는 이 DB의 모든 행에서 비어 있고, 다른 발송 함수들처럼
+//   Secrets의 SOLAPI_SENDER_NUMBER로 대체하도록 되어 있어야 하는데 여기만 빈 문자열을 기본값으로
+//   써서 활성화 후에도 Solapi 발송이 매번 "from 없음"으로 실패하고 있었다. 다른 함수와 동일하게
+//   SOLAPI_SENDER_NUMBER를 fallback으로 쓰도록 고쳤다.
+
+import {
+  CORS_HEADERS,
+  requireAdminKey,
+  getRegistrationDbId,
+  resolveRelatedDatabaseId,
+  notionQueryDatabase,
+  notionGetPage,
+  notionPatchPageProperties,
+  notionCreatePage,
+  getAlimtalkConfig,
+  createSendLogEntry,
+  extractErrorMessage,
+} from "../_shared/adminShared.ts"
+import { normalizePhone, resolveParentPhone, resolveAlimtalkRecipients } from "../_shared/alimtalkShared.ts"
+// (2026-09-25, PART N-18) 대시보드(학원) DB 자동 연결(enqueueDashboardLink)을 제거했다. 오늘
+// Notion API 자체의 429(Retry-After 28~56초) 레이트리밋이 실측 확인됐고, 초기 배포 단계라
+// 기능을 최대한 줄이는 방향으로 가기로 했다 -- 나중에 pull 모델로 별도 작업에서 다시 만들 예정.
+// (예전 import는 `import { enqueueDashboardLink } from "../_shared/dashboardLinkTarget.ts"`,
+// 호출부는 stateChanged 블록 안 한 곳이었다.)
+
+import { resolveKioskHint, queryAllKioskPages, ACTIVE_KIOSK_STATUS } from "../_shared/kioskIdentity.ts"
+import { runAfterResponse } from "../_shared/afterResponse.ts"
+import { decideStamp, isClassPropertyError, kioskCheckMode, walkInAttendanceProperties } from "../_shared/kioskPolicy.ts"
+import { StepTiming } from "../_shared/stepTiming.ts"
+import { patchAttendanceStampLater } from "../_shared/classRoomCopy.ts"
+import { hashPhone, kstDate, markKioskTodayStamp, readKioskPrepared, readKioskTodayRow, type KioskPrepared, type KioskTodayRow } from "../_shared/kioskToday.ts"
+
+// "학생이름(등록)"/"클래스명(등록)" 같은 rollup(title 대상) 속성에서 표시 텍스트를 뽑아낸다.
+function rollupFirstText(prop: any): string {
+  const arr = prop?.rollup?.array ?? []
+  if (!arr.length) return ""
+  const item = arr[0]
+  if (item?.type === "title") return (item.title ?? []).map((t: any) => t.plain_text).join("")
+  if (item?.type === "rich_text") return (item.rich_text ?? []).map((t: any) => t.plain_text).join("")
+  if (item?.type === "formula") return item.formula?.string ?? String(item.formula?.number ?? "")
+  return ""
+}
+
+function formatKstTime(iso: string | null | undefined): string {
+  if (!iso) return ""
+  return new Intl.DateTimeFormat("ko-KR", {
+    timeZone: "Asia/Seoul",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(iso))
+}
+
+// [NEW, 2026-09-19] 카카오 알림톡 템플릿("등하원 안내")의 일자/시간 변수 전용 포맷.
+// 다른 곳(키오스크 화면의 "이미 처리됨" 안내, 보강 출석 페이지 제목 등)의 날짜/시간 표시는
+// 그대로 두고, 알림톡으로 나가는 값만 "2026년 9월 19일"/"오전 9시 40분" 형식으로 만든다.
+// (11/2 사용자) 일자에 요일을 붙인다: "2026년 11월 2일 (월)".
+function formatKstDateKorean(dateStr: string): string {
+  const [y, m, d] = dateStr.split("-").map((v) => parseInt(v, 10))
+  const weekday = "일월화수목금토"[new Date(Date.UTC(y, m - 1, d)).getUTCDay()]
+  return `${y}년 ${m}월 ${d}일 (${weekday})`
+}
+
+function formatKstTimeKorean(iso: string | null | undefined): string {
+  if (!iso) return ""
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Seoul",
+    hour: "numeric",
+    minute: "numeric",
+    hour12: true,
+  }).formatToParts(new Date(iso))
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? ""
+  const period = get("dayPeriod").toUpperCase() === "PM" ? "오후" : "오전"
+  const hour = get("hour")
+  const minute = get("minute").padStart(2, "0")
+  return `${period} ${hour}시 ${minute}분`
+}
+
+type Candidate = { registrationId: string; studentName: string; className: string }
+
+async function findActiveRegistrationsForStudent(registrationDbId: string, studentId: string): Promise<any[]> {
+  return await queryAllKioskPages(body => notionQueryDatabase(registrationDbId, body), {
+    filter: {
+      and: [
+        { property: "학생정보", relation: { contains: studentId } },
+        { property: "수강상태", formula: { string: { equals: ACTIVE_KIOSK_STATUS } } },
+      ],
+    },
+  })
+}
+
+function toCandidate(reg: any): Candidate {
+  const props = reg.properties ?? {}
+  return {
+    registrationId: reg.id,
+    studentName: rollupFirstText(props["학생이름(등록)"]) || "이름 미상",
+    className: rollupFirstText(props["클래스명(등록)"]) || "",
+  }
+}
+
+async function findTodayAttendance(attendanceDbId: string, registrationId: string): Promise<any | null> {
+  const start = kstDate() + "T00:00:00+09:00"
+  const end = kstDate() + "T23:59:59+09:00"
+  const json = await notionQueryDatabase(attendanceDbId, {
+    filter: {
+      and: [
+        { property: "등록", relation: { contains: registrationId } },
+        { property: "수업일시", date: { on_or_after: start } },
+        { property: "수업일시", date: { on_or_before: end } },
+      ],
+    },
+    page_size: 10,
+  })
+  return (json.results ?? [])[0] ?? null
+}
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: CORS_HEADERS })
+
+  // 단계별 소요 시간(ms)만 로그에 남긴다(속도 개선 측정용, 개인정보 없음). "[kiosk-checkin timing]"으로 검색.
+  const timing = new StepTiming()
+  let outcome = "error"
+  const authError = await requireAdminKey(req)
+  timing.mark("auth")
+  if (authError) return authError
+
+  try {
+    const body = await req.json().catch(() => ({}))
+    const type: "checkin" | "checkout" | null =
+      body?.type === "checkout" ? "checkout" : body?.type === "checkin" ? "checkin" : null
+    if (!type) throw new Error("type은 checkin 또는 checkout이어야 합니다.")
+    const phone = normalizePhone(String(body?.phone ?? ""))
+    if (phone.length < 9) throw new Error("전화번호를 정확히 입력해주세요.")
+
+    const hintId: string | null =
+      typeof body?.registrationId === "string" && body.registrationId ? body.registrationId : null
+    // 처리 방식(키오스크 설정): once = 1일 1회, every = 매번 기록. 둘 다 2분 안 같은 버튼은 무시(_shared/kioskPolicy.ts).
+    const mode = kioskCheckMode(body?.mode)
+    const field = type === "checkin" ? "checkin_at" : "checkout_at"
+    const stampProp = type === "checkin" ? "등원스템프" : "하원스템프"
+    const nowIso = new Date().toISOString()
+    const nowMs = Date.parse(nowIso)
+    let attendance: any = null
+    let registrationId: string | null = hintId
+    let studentName = ""
+    let stateChanged = false
+    let alreadyDone = false
+    let alreadyAt = ""
+    let recent = false
+    let fastDone = false
+
+    // 이미 찍힌 스템프를 방식대로 처리하고, 기록이 필요하면 true. "이미/방금"이면 응답 값을 채운다.
+    const needsWrite = (existingIso: string | null | undefined): boolean => {
+      const decision = decideStamp(mode, existingIso, nowMs)
+      if (decision === "write") return true
+      alreadyDone = true
+      recent = decision === "recent"
+      alreadyAt = formatKstTime(existingIso)
+      return false
+    }
+    // 정규 수업 출석은 등원·하원하면 "🟢 출석". 이미 "🔵 보강"인 기록(정규 수업 없는 날의 방문)은 그대로 둔다.
+    const writePatch = (currentStatus: string): { patch: Record<string, unknown>; status: string } => {
+      const patch: Record<string, unknown> = { [stampProp]: { date: { start: nowIso } } }
+      if (currentStatus !== "🔵 보강") patch["출석 상태"] = { select: { name: "🟢 출석" } }
+      return { patch, status: currentStatus === "🔵 보강" ? currentStatus : "🟢 출석" }
+    }
+    // 오늘 준비 행을 Notion과 맞춘다(실패해도 출결 처리에는 영향 없음).
+    // 수업 관리 복사본(v2.5.115)도 같은 출석 행의 등원·하원 시각·상태를 뒤에서 고친다(응답을 늦추지 않고, 실패해도 출결 처리에 영향 없음).
+    const syncToday = (regId: string, iso: string | null, status: string, pageId?: string, copyId?: string) => {
+      patchAttendanceStampLater(copyId ?? pageId, type === "checkin" ? "arrived_at" : "left_at", iso, status)
+      return markKioskTodayStamp(regId, field, iso, status, pageId).catch(err => console.error("kiosk today stamp error:", extractErrorMessage(err)))
+    }
+
+    // [v2.5.37] 오늘 출석 준비(_shared/kioskToday.ts)가 있으면 Notion 조회 없이 바로 기록한다.
+    // 준비된 행은 오늘(KST) 날짜·전화번호 해시가 맞을 때만 쓴다. 출석 페이지가 없거나(보강 생성 필요)
+    // 기록이 실패하면(그 사이 출석이 지워짐 등) 아래 예전 방식으로 처리한다.
+    let prepared: KioskPrepared | null = null
+    let row: KioskTodayRow | null = null
+    try {
+      ;[prepared, row] = await Promise.all([readKioskPrepared(), hintId ? readKioskTodayRow(hintId) : Promise.resolve(null)])
+    } catch (cacheErr) {
+      console.error("kiosk today read error:", extractErrorMessage(cacheErr))
+    }
+    timing.mark("cache")
+    const today = kstDate()
+    if (prepared?.kst_date === today && row && row.kst_date === today && row.attendance_page_id && row.phone_hashes.includes(await hashPhone(phone))) {
+      const pageId = row.attendance_page_id
+      studentName = row.student_name || "이름 미상"
+      registrationId = row.registration_id
+      try {
+        let existing = row[field]
+        let currentStatus = row.attendance_status
+        // [v2.5.39] 준비 표가 "이미 처리"라고 하면 1일 1회에서는 Notion을 한 번 더 확인한다(그 사이 Notion에서
+        // 스템프를 지웠으면 다시 기록할 수 있게). 2분 안 재입력은 확인 없이 무시한다.
+        if (existing && decideStamp(mode, existing, nowMs) === "already") {
+          const page = await notionGetPage(pageId)
+          timing.mark("notion_recheck")
+          existing = page.properties?.[stampProp]?.date?.start ?? null
+          currentStatus = page.properties?.["출석 상태"]?.select?.name ?? currentStatus
+          if (!existing) await syncToday(row.registration_id, null, currentStatus, undefined, pageId)
+        }
+        if (needsWrite(existing)) {
+          const { patch, status } = writePatch(currentStatus)
+          await notionPatchPageProperties(pageId, patch)
+          timing.mark("attendance_write")
+          attendance = { id: pageId }
+          stateChanged = true
+          await syncToday(row.registration_id, nowIso, status, undefined, pageId)
+          timing.mark("cache_write")
+        }
+        fastDone = true
+      } catch (fastErr) {
+        console.error("kiosk fast path fallback:", extractErrorMessage(fastErr))
+        studentName = ""
+        registrationId = hintId
+        alreadyDone = false
+        recent = false
+        alreadyAt = ""
+      }
+    }
+
+    if (!fastDone) {
+      const registrationDbId = getRegistrationDbId()
+      // 학생·출석 DB ID는 바뀌지 않으므로 준비된 값이 있으면 그대로 쓴다(측정상 약 0.8초).
+      const [studentDbId, attendanceDbId] = prepared?.student_db_id && prepared?.attendance_db_id
+        ? [prepared.student_db_id, prepared.attendance_db_id]
+        : await Promise.all([resolveRelatedDatabaseId(registrationDbId, "학생정보"), resolveRelatedDatabaseId(registrationDbId, "출석")])
+      timing.mark("db_ids")
+
+      // 등록 ID는 클라이언트 힌트. 타 DB/종료 등록/다른 연락처를 출결 처리하지 않는다.
+      const refreshCandidates = () => {
+        outcome = "refresh"
+        return new Response(JSON.stringify({ refreshCandidates: true, error: "학생 목록이 변경되었습니다. 다시 선택해주세요." }), {
+          status: 409, headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        })
+      }
+
+      if (!registrationId) {
+        // 학생 연락처/어머니 연락처/아버지 연락처 저장 형식이 사람마다 달라서(하이픈 유무 등) Notion
+        // 필터의 정확 일치에 기대지 않는다. 구버전 화면/목록 누락 때만 전체 조회로 보완한다.
+        const students = await queryAllKioskPages(body => notionQueryDatabase(studentDbId, body))
+        const matchedStudents = students.filter((s: any) => {
+          const p = s.properties ?? {}
+          return (
+            normalizePhone(p["학생 연락처"]?.phone_number ?? "") === phone ||
+            normalizePhone(p["어머니 연락처"]?.phone_number ?? "") === phone ||
+            normalizePhone(p["아버지 연락처"]?.phone_number ?? "") === phone ||
+            normalizePhone(p["기타 보호자 연락처"]?.phone_number ?? "") === phone
+          )
+        })
+
+        const candidates: Candidate[] = []
+        for (const student of matchedStudents) {
+          const regs = await findActiveRegistrationsForStudent(registrationDbId, student.id)
+          candidates.push(...regs.map(toCandidate))
+        }
+
+        timing.mark("full_lookup")
+        if (candidates.length === 0) {
+          outcome = "no_match"
+          return new Response(JSON.stringify({ matched: false }), {
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          })
+        }
+        if (candidates.length > 1) {
+          outcome = "pick"
+          return new Response(JSON.stringify({ needsSelection: true, candidates }), {
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          })
+        }
+        registrationId = candidates[0].registrationId
+        studentName = candidates[0].studentName
+      }
+
+      const registrationPage = await resolveKioskHint({ registrationId, phone, registrationDbId, studentDbId, getPage: notionGetPage })
+      timing.mark("verify")
+      if (!registrationPage) return refreshCandidates()
+      if (!studentName) {
+        studentName = rollupFirstText(registrationPage.properties?.["학생이름(등록)"]) || "이름 미상"
+      }
+      const classIds: string[] = (registrationPage.properties?.["클래스"]?.relation ?? []).map((r: any) => r.id)
+
+      attendance = await findTodayAttendance(attendanceDbId, registrationId)
+      timing.mark("attendance_find")
+
+      if (attendance) {
+        const existing = attendance.properties?.[stampProp]?.date?.start ?? null
+        const currentStatus = attendance.properties?.["출석 상태"]?.select?.name ?? ""
+        if (needsWrite(existing)) {
+          const { patch, status } = writePatch(currentStatus)
+          await notionPatchPageProperties(attendance.id, patch)
+          timing.mark("attendance_write")
+          stateChanged = true
+          await syncToday(registrationId, nowIso, status, attendance.id)
+        } else {
+          await syncToday(registrationId, existing, currentStatus, attendance.id)
+        }
+      } else {
+        // 정규 수업이 없는 날의 방문(시험기간 등 특수 상황) -- 출석 페이지를 새로 만들고 보강으로 표시.
+        // 담당강사는 이때만 필요하므로 클래스 페이지도 이때만 읽는다.
+        let teacherIds: string[] = []
+        if (classIds.length) {
+          const classPage = await notionGetPage(classIds[0])
+          teacherIds = (classPage.properties?.["담당강사"]?.relation ?? []).map((r: any) => r.id)
+        }
+        timing.mark("class")
+        const title = `${studentName} ${today} 보강(${type === "checkin" ? "등원" : "하원"})`
+        const walkIn = { title, registrationId, nowIso, stampProp, classIds, teacherIds }
+        // 출석 `클래스`가 롤업인 학원(원본)에서는 클래스를 쓸 수 없어 Notion이 거절한다 → 클래스 없이 다시 만든다(롤업이 등록에서 채운다).
+        try {
+          attendance = await notionCreatePage(attendanceDbId, walkInAttendanceProperties({ ...walkIn, includeClass: true }))
+        } catch (err) {
+          if (!classIds.length || !isClassPropertyError((err as Error).message)) throw err
+          attendance = await notionCreatePage(attendanceDbId, walkInAttendanceProperties({ ...walkIn, includeClass: false }))
+        }
+        timing.mark("attendance_write")
+        stateChanged = true
+        // 새로 만든 보강 출석을 준비 표에 연결해 다음 등원·하원부터 빠른 경로로 처리한다.
+        await syncToday(registrationId, nowIso, "🔵 보강", attendance.id)
+      }
+    }
+    // 카카오 알림톡 (등원/하원 통합 템플릿이 아직 설정 전이면 조용히 건너뛴다).
+    // [v2.5.36] 출석 기록까지만 기다리고 바로 응답한다. 알림톡 설정 조회·발송·전송로그는 응답 뒤에
+    // EdgeRuntime.waitUntil로 마저 처리한다(측정: 화면 대기 약 1.4초 단축). 실패는 지금처럼 전송로그에 남는다.
+    if (stateChanged) {
+      // 이 시점에는 등록이 정해져 있다(빠른 경로: 준비된 행, 예전 방식: 확인된 등록).
+      const notifyRegistrationId: string = registrationId ?? ""
+      const notify = async () => {
+        const bg = new StepTiming()
+        try {
+          const category = "키오스크 알림톡"
+          // [FIX, 2026-09-19] "알림톡 설정(학원) DB"의 "발신번호"가 비어 있으면(운영 중인 모든 행이 그렇다)
+          // 다른 발송 함수들(send-daily-report 등, _shared/alimtalkShared.ts)처럼 Secrets의
+          // SOLAPI_SENDER_NUMBER로 대체해야 하는데, 여기만 빈 문자열 fallback을 써서 Solapi 발송이
+          // "from"이 비어 있다는 이유로 매번 조용히 실패하고 있었다(전송로그에는 실패로 남았지만
+          // 활성화 전 정상 skip과 구분이 잘 안 됐음).
+          const config = await getAlimtalkConfig(category, {
+            pfId: "",
+            templateId: "",
+            senderNumber: Deno.env.get("SOLAPI_SENDER_NUMBER") ?? "",
+          })
+          bg.mark("alimtalk_config")
+          if (config.pfId && config.templateId) {
+            try {
+              const parentPhone = await resolveParentPhone(attendance, notifyRegistrationId)
+              if (!parentPhone) throw new Error("학부모 연락처를 찾을 수 없습니다.")
+              bg.mark("parent_phone")
+
+              const { SolapiMessageService } = await import("npm:solapi")
+              const messageService = new SolapiMessageService(
+                Deno.env.get("SOLAPI_API_KEY")!,
+                Deno.env.get("SOLAPI_API_SECRET")!,
+              )
+              const recipients = await resolveAlimtalkRecipients({
+                registrationId: notifyRegistrationId,
+                primaryPhone: parentPhone,
+                recipientTarget: config.recipientTarget,
+              })
+              bg.mark("recipients")
+              for (const recipient of recipients) {
+                await messageService.send({
+                  to: recipient.phone,
+                  from: normalizePhone(config.senderNumber),
+                  kakaoOptions: {
+                    pfId: config.pfId,
+                    templateId: config.templateId,
+                    variables: {
+                      "학생이름": studentName,
+                      "구분": type === "checkin" ? "등원" : "하원",
+                      "일자": formatKstDateKorean(kstDate()),
+                      "시간": formatKstTimeKorean(nowIso),
+                    },
+                    disableSms: true,
+                  },
+                }, { allowDuplicates: true })
+              }
+              bg.mark("send")
+              await createSendLogEntry({
+                registrationId: notifyRegistrationId,
+                attendanceId: attendance.id,
+                attendanceType: type === "checkin" ? "등원" : "하원",
+                title: studentName,
+                category,
+                status: "성공",
+              })
+              bg.mark("send_log")
+            } catch (sendErr) {
+              await createSendLogEntry({
+                registrationId: notifyRegistrationId,
+                attendanceId: attendance.id,
+                attendanceType: type === "checkin" ? "등원" : "하원",
+                title: studentName,
+                category,
+                status: "실패",
+                failReason: extractErrorMessage(sendErr),
+              })
+              bg.mark("send_fail_log")
+            }
+          }
+        } catch (bgErr) {
+          console.error("kiosk-checkin alimtalk error:", extractErrorMessage(bgErr))
+        } finally {
+          console.log("[kiosk-checkin timing alimtalk]", JSON.stringify(bg.summary()))
+        }
+      }
+      await runAfterResponse(notify())
+    }
+    outcome = alreadyDone ? "already" : "done"
+    return new Response(JSON.stringify({ matched: true, studentName, alreadyDone, alreadyAt, recent }), {
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Server-Timing": timing.header(), "Timing-Allow-Origin": "*" },
+    })
+  } catch (err) {
+    console.error("kiosk-checkin error:", err)
+    return new Response(JSON.stringify({ error: extractErrorMessage(err) }), {
+      status: 500,
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    })
+  } finally {
+    console.log("[kiosk-checkin timing]", JSON.stringify({ outcome, ...timing.summary() }))
+  }
+})

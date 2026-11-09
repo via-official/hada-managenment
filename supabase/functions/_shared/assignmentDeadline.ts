@@ -1,0 +1,105 @@
+// Assignment deadline policy: own registration + nearest later attendance, not weekday timetable.
+// (v2.8.0) 자동 처리는 빈 마감만 채운다. 이미 있는 마감은 출처와 무관하게 보존하고, 조정은 [과제 마감일 조정] 버튼이나 직접 수정으로 한다.
+export type DeadlineIO = {
+  getPage: (id: string) => Promise<any>
+  query: (db: string, body: Record<string, unknown>) => Promise<any>
+  update: (id: string, properties: Record<string, unknown>) => Promise<any>
+  attendanceDb: string
+  activityDb: string
+}
+export function ids(page: any, name: string): string[] {
+  return (page?.properties?.[name]?.relation ?? []).map((r: any) => r.id)
+}
+function key(id: string) { return id.replace(/-/g, "").toLowerCase() }
+function same(a: string[], b: string[]) { return a.length === b.length && a.every((id, i) => key(id) === key(b[i])) }
+function live(page: any) { return page && !page.archived && !page.in_trash && !page.properties?.["삭제 체크"]?.checkbox }
+export function automaticDeadlineAllowed(page: any): boolean {
+  return ids(page, "과제 마감").length === 0
+}
+export async function queryEveryPage(io: DeadlineIO, db: string, body: Record<string, unknown>): Promise<any[]> {
+  const rows: any[] = []; let cursor: string | undefined
+  do {
+    const result = await io.query(db, { ...body, page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) })
+    rows.push(...(result.results ?? []))
+    if (result.has_more && (!result.next_cursor || result.next_cursor === cursor)) throw new Error("deadline pagination cursor missing/repeated")
+    cursor = result.has_more ? result.next_cursor : undefined
+  } while (cursor)
+  return rows
+}
+export async function findNextDeadline(io: DeadlineIO, registrationId: string, afterIso: string): Promise<string | null> {
+  // Multiple pages if the first result is a deleted/invalid attendance. Never link across registrations.
+  let cursor: string | undefined
+  do {
+    const result = await io.query(io.attendanceDb, {
+      filter: { and: [
+        { property: "등록", relation: { contains: registrationId } },
+        { property: "수업일시", date: { after: afterIso } },
+        { property: "삭제 체크", checkbox: { equals: false } },
+      ] },
+      sorts: [{ property: "수업일시", direction: "ascending" }], page_size: 10,
+      ...(cursor ? { start_cursor: cursor } : {}),
+    })
+    for (const page of result.results ?? []) {
+      const time = page.properties?.["수업일시"]?.date?.start
+      if (live(page) && same(ids(page, "등록"), [registrationId]) && time && Date.parse(time) > Date.parse(afterIso)) return page.id
+    }
+    if (result.has_more && (!result.next_cursor || result.next_cursor === cursor)) throw new Error("attendance pagination cursor missing/repeated")
+    cursor = result.has_more ? result.next_cursor : undefined
+  } while (cursor)
+  return null
+}
+// One narrow query per registration. Notion filters out completed tasks and tasks that already have a deadline.
+export async function pendingDeadlineActivities(io: DeadlineIO, registrationId: string): Promise<string[]> {
+  const rows = await queryEveryPage(io, io.activityDb, { filter: { and: [
+    { property: "등록", relation: { contains: registrationId } },
+    { property: "과제상태", select: { equals: "🔴 미제출" } },
+    { property: "삭제 체크", checkbox: { equals: false } },
+    { property: "과제 마감", relation: { is_empty: true } },
+  ] } })
+  return rows.filter(p => live(p) && same(ids(p, "등록"), [registrationId]) && automaticDeadlineAllowed(p)).map(p => p.id)
+}
+export async function reconcileDeadline(io: DeadlineIO, activityId: string, triggerAttendanceId: string): Promise<string> {
+  const activity = await io.getPage(activityId)
+  if (!live(activity) || activity.properties?.["과제상태"]?.select?.name !== "🔴 미제출" || !automaticDeadlineAllowed(activity)) return "preserved"
+  const owners = ids(activity, "등록"), sources = ids(activity, "출석"), records = ids(activity, "학습기록")
+  if (owners.length !== 1 || sources.length !== 1 || records.length !== 1) return "invalid_relations"
+  const [trigger, source, record] = await Promise.all([io.getPage(triggerAttendanceId), io.getPage(sources[0]), io.getPage(records[0])])
+  const after = source?.properties?.["수업일시"]?.date?.start
+  const triggerTime = trigger?.properties?.["수업일시"]?.date?.start
+  if (!live(trigger) || !live(source) || !live(record) || record.properties?.["구분"]?.select?.name !== "과제" ||
+    !same(ids(trigger, "등록"), owners) || !same(ids(source, "등록"), owners) || !after || !triggerTime || Date.parse(triggerTime) <= Date.parse(after)) return "invalid_source"
+  // Read the activity again before writing: a deadline set by the button or by hand since queuing wins.
+  const fresh = await io.getPage(activityId)
+  if (!live(fresh) || fresh.properties?.["과제상태"]?.select?.name !== "🔴 미제출" || !automaticDeadlineAllowed(fresh) ||
+    !same(ids(fresh, "등록"), owners) || !same(ids(fresh, "출석"), sources) || !same(ids(fresh, "학습기록"), records) ||
+    !same(ids(fresh, "과제 마감"), ids(activity, "과제 마감"))) return "changed"
+  const nextId = await findNextDeadline(io, owners[0], after)
+  if (!nextId) return "no_next_attendance"
+  await io.update(activityId, {
+    "과제 마감": { relation: [{ id: nextId }] },
+    "학습정보 수정일": { date: { start: new Date().toISOString() } },
+  })
+  return "updated"
+}
+// (v2.6.12) 여러 등록의 대기 과제를 한 번에(등록 50명씩 묶어 조회). 출석 조정이 새 출석을 만들 때 학생마다 따로 조회하지 않는다.
+export async function pendingDeadlinesForRegistrations(io: DeadlineIO, registrationIds: string[]): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>()
+  const regs = [...new Set(registrationIds.map(key))]
+  for (let i = 0; i < regs.length; i += 50) {
+    const chunk = regs.slice(i, i + 50)
+    const rows = await queryEveryPage(io, io.activityDb, { filter: { and: [
+      { or: chunk.map((id) => ({ property: "등록", relation: { contains: id } })) },
+      { property: "과제상태", select: { equals: "🔴 미제출" } },
+      { property: "삭제 체크", checkbox: { equals: false } },
+      { property: "과제 마감", relation: { is_empty: true } },
+    ] } })
+    for (const p of rows) {
+      const owner = ids(p, "등록")
+      if (!live(p) || owner.length !== 1 || !automaticDeadlineAllowed(p)) continue
+      const reg = key(owner[0])
+      if (!chunk.includes(reg)) continue
+      out.set(reg, [...(out.get(reg) ?? []), p.id])
+    }
+  }
+  return out
+}

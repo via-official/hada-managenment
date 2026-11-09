@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# 과거에 실제로 재발했던 속성명/설정 버그가 이번 배포본에도 다시 있는지 확인하는
+# 가벼운 grep 기반 회귀 가드. deploy 워크플로우가 Supabase에 배포하기 *전에* 이 스크립트를
+# 실행해서, 여기서 하나라도 걸리면 배포를 막는다 (로드맵 3번: "배포 전 자동 검증 절차 없음" 개선).
+#
+# 여기 있는 검사 항목은 전부 "실제로 한 번 이상 재발했던 버그"에서 나온 것들이다.
+# 새로운 재발 패턴을 발견하면 이 파일에 검사를 추가한다.
+set -uo pipefail
+
+cd "$(dirname "$0")/.."
+
+fail=0
+
+# 1) (v2.7.11) 예전 "배치" 관계 속성명 검사는 검사 대상(generate-report·generate-tuition·send-selected-notifications)을
+#    지우면서 함께 뺐다.
+
+# 2) (로드맵 5-17) create-learning-record / sync-registration-textbook
+#    세 함수가 동시에 같은 import를 빠뜨리고 있던 적이 있다. notionClient를 쓰는 함수는
+#    반드시 _shared/notionClient.ts를 정상적으로 import해야 한다.
+IMPORT_CHECK_FILES=(
+	supabase/functions/create-learning-record/index.ts
+	supabase/functions/sync-registration-textbook/index.ts
+)
+for f in "${IMPORT_CHECK_FILES[@]}"; do
+	if [ -f "$f" ] && grep -q 'notionClient\.' "$f" && ! grep -q 'from "\.\./_shared/notionClient\.ts"' "$f"; then
+		echo "❌ $f: notionClient를 참조하지만 정상적으로 import하고 있지 않음"
+		fail=1
+	fi
+done
+
+# 3) 일일보고서는 토큰만 확인하고 바로 발송하던 과거 경로로 돌아가면 안 된다.
+#    (반별 send-class-daily-reports는 v2.7.11에서 지웠다) 공용 최신화 경로를 사용하고, 공용 경로는 반드시
+#    토큰 보장 -> 출석 원본 -> 완성 캐시 순서여야 한다.
+for f in \
+  supabase/functions/send-daily-report/index.ts; do
+  if ! grep -q 'refreshDailyReportForSend' "$f"; then
+    echo "❌ $f: 일일보고서 전송 전 공용 최신화 경로가 빠졌습니다."
+    fail=1
+  fi
+done
+REFRESH_FILE=supabase/functions/_shared/dailyReportRefresh.ts
+if [ -f "$REFRESH_FILE" ]; then
+  token_line=$(grep -n 'await syncStudentReport' "$REFRESH_FILE" | head -1 | cut -d: -f1)
+  attendance_line=$(grep -n 'await syncAttendanceForRegistration' "$REFRESH_FILE" | head -1 | cut -d: -f1)
+  cache_line=$(grep -n 'await syncReportCacheForRegistration' "$REFRESH_FILE" | head -1 | cut -d: -f1)
+  if [ -z "$token_line" ] || [ -z "$attendance_line" ] || [ -z "$cache_line" ] || \
+     [ "$token_line" -ge "$attendance_line" ] || [ "$attendance_line" -ge "$cache_line" ]; then
+    echo "❌ $REFRESH_FILE: 토큰 -> 출석 원본 -> 보고서 캐시 순서가 깨졌습니다."
+    fail=1
+  fi
+else
+  echo "❌ $REFRESH_FILE: 일일보고서 공용 최신화 파일이 없습니다."
+  fail=1
+fi
+
+# 4) 등록 페이지/웹앱의 수동 학생 페이지 동기화는 전송과 같은 전체 최신화 경로를 사용해야 한다.
+SYNC_CACHE_FILE=supabase/functions/sync-report-cache/index.ts
+if ! grep -q 'refreshStudentReport' "$SYNC_CACHE_FILE" || ! grep -q 'isRegistrationPage' "$SYNC_CACHE_FILE"; then
+  echo "❌ $SYNC_CACHE_FILE: 등록 페이지 수동 전체 최신화 경로가 빠졌습니다."
+  fail=1
+fi
+if grep -q 'Promise.all(ids.map((id) => requestSyncForRegistrationId' student_report_part2.js; then
+  echo "❌ student_report_part2.js: 여러 등록의 수동 최신화를 다시 병렬 호출하고 있습니다."
+  fail=1
+fi
+
+# 5) 주간/월간 보고서는 전체 최신화와 선생님 코멘트 검증 성공 후에만 발송해야 한다.
+SEND_REPORT_FILE=supabase/functions/send-report/index.ts
+if ! grep -q 'refreshStudentReport' "$SEND_REPORT_FILE"; then
+  echo "❌ $SEND_REPORT_FILE: 주간/월간 전송 전 전체 최신화가 빠졌습니다."
+  fail=1
+fi
+if ! grep -q '선생님 코멘트가 최신 보고서 캐시에 포함되지 않았습니다' "$SEND_REPORT_FILE"; then
+  echo "❌ $SEND_REPORT_FILE: 선생님 코멘트 포함 검증이 빠졌습니다."
+  fail=1
+fi
+if [ "$(grep -c 'clearBulkSelectFlag(reportId)' "$SEND_REPORT_FILE")" -lt 2 ]; then
+  echo "❌ $SEND_REPORT_FILE: 일괄전송 실패 건의 선택 해제가 빠져 무한 반복 위험이 있습니다."
+  fail=1
+fi
+if ! grep -q 'id: rp.id' supabase/functions/_shared/reportCacheBuilder.ts; then
+  echo "❌ reportCacheBuilder.ts: 캐시에 보고서 ID가 없어 현재 코멘트 포함 여부를 검증할 수 없습니다."
+  fail=1
+fi
+
+# 6) 학습활동의 "구분"은 롤업 속성이다. rollup을 텍스트로 해석하지 못하면 과제/평가가
+#    모두 빈 분류로 탈락해 HTML에 "해당 없음"으로 표시된다.
+if ! grep -q 'case "rollup"' supabase/functions/_shared/reportCacheShared.ts; then
+  echo "❌ reportCacheShared.ts: 롤업 텍스트 해석이 없어 과제/평가 분류가 누락됩니다."
+  fail=1
+fi
+
+# 7) 등록 페이지 수동 동기화는 그룹 공통 학습기록/학습활동을 공유하는 학생 캐시에도
+#    순차 전파해야 한다. 그렇지 않으면 한 학생만 최신 범위·내용을 보고 나머지는 과거 캐시를 본다.
+if ! grep -q 'resolveSharedLearningRegistrationIds' "$SYNC_CACHE_FILE"; then
+  echo "❌ $SYNC_CACHE_FILE: 공유 학습기록의 관련 학생 캐시 전파가 빠졌습니다."
+  fail=1
+fi
+
+# 8) 학생 화면에는 "[과제] 학생명 날짜" 같은 학습활동 페이지명을 노출하지 않는다.
+#    과제·평가는 연결된 학습기록의 교재/범위/단원/내용으로 조립해야 한다.
+if grep -q 'content: text(props\\[\"학습활동\"\\])' supabase/functions/_shared/reportCacheBuilder.ts; then
+  echo "❌ reportCacheBuilder.ts: 내부 학습활동 페이지명이 학생 화면 데이터로 다시 노출됩니다."
+  fail=1
+fi
+# [FIX, 2026-09-27] "100점 💯" 규칙은 이후 디자인 결정으로 폐기됐다(만점 축하 이모지를 아예
+# 표시하지 않기로 함, DESIGN 문서 12장 아이콘 규칙 참고). 그 문구를 다시 요구하지 않는다.
+if ! grep -q 'renderLogMetaRows' student_report_part1.js; then
+  echo "❌ 학생 리포트: 디자인 문서의 단원·내용 줄 분리 규칙이 빠졌습니다."
+  fail=1
+fi
+if grep -q '내용: \\${note}' student_report_part1.js; then
+  echo "❌ 학생 리포트: 내용 원문 앞에 불필요한 '• 내용:' 라벨이 다시 추가됐습니다."
+  fail=1
+fi
+if ! grep -q 'reportWeekLabel' student_report_part2.js || ! grep -q 'openReportPeriodPicker' student_report_part2.js || ! grep -q 'report-period-modal' student_report.html; then
+  echo "❌ 학생 리포트: 일간·주간·월간 달력형 기간 선택기 또는 M월 N주차 표기가 빠졌습니다."
+  fail=1
+fi
+
+# 9) 학교 성적은 내부 운영 전용이다. 학부모용 화면·캐시 생성·공개 응답에 노출하지 않는다.
+if grep -Eq 'grades-section|renderGradesPage|buildGradeTableHtml|buildGradeChartHtml' student_report.html student_report_part1.js student_report_part2.js; then
+  echo "❌ 학생 리포트: 학부모 화면에 학교 성적 UI가 다시 추가됐습니다."
+  fail=1
+fi
+if grep -q 'sp\["성적"\]' supabase/functions/_shared/reportCacheBuilder.ts; then
+  echo "❌ reportCacheBuilder.ts: 학부모 캐시에 학교 성적을 다시 수집하고 있습니다."
+  fail=1
+fi
+if ! grep -q '_privateGrades' supabase/functions/get-report-fast/index.ts; then
+  echo "❌ get-report-fast: 기존 캐시의 학교 성적을 공개 응답에서 제거하는 보호 장치가 없습니다."
+  fail=1
+fi
+
+# 10) 전역 새로고침 버튼은 기기별 이모지 대신 지정된 아이콘을 사용한다.
+# [FIX, 2026-09-27] Feather 아이콘 통일 작업으로 <img> 기반 아이콘을 인라인 <svg>로 교체했다
+# (DESIGN 문서 12장 아이콘 규칙 참고). 아이콘 형식이 아니라 이모지가 다시 쓰이는지, 접근성
+# 라벨이 남아있는지만 확인한다.
+if grep -q '>🔄</button>' student_report.html || ! grep -q 'global-sync-fab.*aria-label="새로고침".*<svg' student_report.html; then
+  echo "❌ 학생 리포트: 전역 새로고침 버튼의 아이콘 또는 접근성 라벨이 빠졌습니다."
+  fail=1
+fi
+
+# 11) 브랜드 색상은 개별 하드코딩 대신 공용 팔레트 변수로 관리한다.
+if ! grep -q -- '--brand-primary: #e6d8c4' student_report.html || ! grep -q -- '--brand-soft: #f5efe7' student_report.html || ! grep -q 'background: var(--brand-primary)' student_report.html; then
+  echo "❌ 학생 리포트: 공용 브랜드 팔레트 또는 주요 컴포넌트 연결이 빠졌습니다."
+  fail=1
+fi
+
+# 12) 헤더는 44px 클릭 영역을 유지하고, 뒤로가기·메뉴 모두 20px 선형 SVG와 투명 배경을 사용한다.
+if grep -Eq '>←</button>|>☰</button>' student_report_part1.js student_report_part2.js || ! grep -q '.header-icon { width: 20px; height: 20px' student_report.html || ! grep -q '.reg-back-btn {.*background: transparent' student_report.html || ! grep -q '.hamburger-btn {' student_report.html; then
+  echo "❌ 학생 리포트: 헤더 선형 아이콘·클릭 영역 또는 투명 배경 규칙이 빠졌습니다."
+  fail=1
+fi
+
+# 13) 접힌 상세 헤더는 56px 높이 안에서 한 줄을 수직 중앙 정렬하고 이동 경로 전체를 같은 볼드 굵기로 표시한다.
+if ! grep -q '.reg-header-bar { min-height: 56px; padding: 6px 10px; box-sizing: border-box; }' student_report.html || ! grep -q '.reg-header-bar:not(.expanded) .reg-header-top { height: 44px; margin-bottom: 0; align-items: center; }' student_report.html || ! grep -q '.reg-breadcrumb {.*font-weight: 700;' student_report.html || ! grep -q '.reg-breadcrumb .crumb.current { font-weight: inherit;' student_report.html; then
+  echo "❌ 학생 리포트: 접힌 상세 헤더의 높이·중앙 정렬·통일된 볼드 규칙이 빠졌습니다."
+  fail=1
+fi
+
+# 14) 기간 제목은 좌우 동일 폭 3열 중앙 정렬, 메뉴 닫기는 투명 헤더 버튼, 본문은 하단 안전 여백을 사용한다.
+#     새로고침은 하나의 전역 버튼을 화면마다 오른쪽 위에 둔다: 첫 화면은 메뉴(≡) 왼쪽, 반·교재 상세는 접힌 헤더 오른쪽.
+#     (2026-09-19 떠 있는 버튼으로 통일 → 2026-10-12 카드를 가려 오른쪽 위 아이콘으로 변경. 상세 화면 전용 버튼을 따로 만들지 않는다)
+if ! grep -q 'grid-template-columns: clamp(82px, 18vw, 120px) minmax(0, 1fr) clamp(82px, 18vw, 120px)' student_report.html || ! grep -q 'body.has-detail-header .global-sync-fab { top: 6px; right: 10px;' student_report.html || grep -q 'class="header-sync' student_report_part1.js student_report_part2.js || ! grep -q 'body.has-tabbar .reg-tab-content { padding-bottom: calc(96px' student_report.html || ! grep -q 'class="menu-close".*<svg class="header-icon"' student_report.html || ! grep -q 'has-detail-header.*view === "detail" || view === "book"' student_report_part2.js; then
+  echo "❌ 학생 리포트: 기간 중앙 정렬·상세 헤더 버튼·하단 안전 여백 규칙이 빠졌습니다."
+  fail=1
+fi
+
+# 15) 상세 헤더의 이동 경로는 텍스트만 사용하고 클래스·탭·교재 이모지를 넣지 않는다.
+if grep -q 'crumb.*r\.emoji' student_report_part1.js student_report_part2.js || grep -q 'crumb current.*\.icon' student_report_part2.js || grep -Eq 'crumb[^>]*>[^<]*(📚|📘)' student_report_part1.js; then
+  echo "❌ 학생 리포트: 헤더 이동 경로에 이모지가 다시 포함됐습니다."
+  fail=1
+fi
+
+
+# 16) 알림톡 수신 대상 설정은 모든 실발송 경로에 연결되고, 미설정 시 우선 연락 대상을 유지한다.
+if ! grep -qF 'recipientTarget: ["우선 연락 대상"]' supabase/functions/_shared/adminShared.ts || ! grep -q 'export async function resolveAlimtalkRecipients' supabase/functions/_shared/alimtalkShared.ts; then
+  echo "❌ 알림톡: 우선 연락 대상 기본값 또는 공용 수신자 해석기가 빠졌습니다."
+  fail=1
+fi
+for file in \
+  supabase/functions/send-report/index.ts \
+  supabase/functions/send-tuition-notice/index.ts \
+  supabase/functions/send-textbook-notice/index.ts \
+  supabase/functions/kiosk-checkin/index.ts; do
+  if ! grep -q 'resolveAlimtalkRecipients' "$file"; then
+    echo "❌ 알림톡: $file에 수신 대상 설정 연결이 빠졌습니다."
+    fail=1
+  fi
+done
+if ! grep -q 'registrationId, primaryPhone: parentPhone' supabase/functions/send-daily-report/index.ts; then
+  echo "❌ 알림톡: 일일 보고서 발송 경로에 수신 대상 설정 연결이 빠졌습니다."
+  fail=1
+fi
+
+# 17) Notion 업로드 PDF/파일은 만료 URL을 캐시에만 의존하면 안 된다. blockId를 저장하고,
+#     학생 보고서 토큰으로 접근 권한을 검증한 뒤 최신 URL을 발급하는 함수를 유지한다.
+#     (v2.5.95) 본문 블록 변환은 feedBody.ts로 옮겼다. 리포트 캐시는 그 파일의 readPageBodyBlocks를 쓴다.
+if ! grep -q 'import { readPageBodyBlocks } from "./feedBody.ts"' supabase/functions/_shared/reportCacheBuilder.ts; then
+  echo "❌ reportCacheBuilder.ts: 학습기록 본문 변환(feedBody.ts)을 쓰지 않습니다."
+  fail=1
+fi
+if ! grep -q 'type === "pdf" || type === "file"' supabase/functions/_shared/feedBody.ts; then
+  echo "❌ feedBody.ts: PDF/파일 블록 수집이 빠졌습니다."
+  fail=1
+fi
+if ! grep -q 'blockId: String(b.id' supabase/functions/_shared/feedBody.ts; then
+  echo "❌ feedBody.ts: 만료 URL 갱신에 필요한 파일 blockId가 없습니다."
+  fail=1
+fi
+if ! grep -q 'containsBlockId(row.registration_detail' supabase/functions/get-report-file/index.ts; then
+  echo "❌ get-report-file: 보고서 토큰의 파일 접근 권한 검증이 빠졌습니다."
+  fail=1
+fi
+if grep -rq 'disableSms: false' supabase/functions; then
+  echo "❌ 알림톡 대체 문자가 다시 켜졌습니다(비용이 늘어납니다)."
+  fail=1
+fi
+if ! grep -q 'letters.some' supabase/functions/get-report-letter/index.ts; then
+  echo "❌ get-report-letter: 보낸 달만 여는 검증이 빠졌습니다."
+  fail=1
+fi
+if ! grep -q 'get-report-file' student_report_part1.js; then
+  echo "❌ student_report_part1.js: 최신 파일 URL 요청 코드가 빠졌습니다."
+  fail=1
+fi
+
+# 18) 폐기한 웹훅 함수가 코드·현재 기준 문서에 다시 들어오면 안 된다(v2.5.21).
+#     옛 문서를 근거로 체크리스트·매핑표에 되살아나는 일이 반복됐다. 과거 패치노트
+#     (docs/updates)와 CHANGELOG, 운영 저장소의 업데이트 이력(docs/operation-update-history.md — 서버에서
+#     지운 함수 목록을 적는 곳)은 이력이므로 검사하지 않는다(v2.7.13).
+RETIRED_WEBHOOKS='sync-registration-timetable|sync-student-report|mark-report-source-dirty|sync-school-schedules'
+retired_hits=$(grep -rnE "$RETIRED_WEBHOOKS" \
+  --include='*.ts' --include='*.js' --include='*.html' --include='*.md' --include='*.sql' \
+  --include='*.yml' --include='*.py' --include='*.cjs' \
+  --exclude-dir=updates --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.local --exclude=CHANGELOG.md \
+  --exclude=operation-update-history.md --exclude=check-known-regressions.sh . || true)
+if [ -n "$retired_hits" ]; then
+  echo "❌ 폐기한 웹훅 함수 이름이 다시 들어왔습니다. 되살리려면 이 검사부터 고치세요:"
+  echo "$retired_hits"
+  fail=1
+fi
+
+# 출석(학원) DB의 속성 이름은 "선생님 한마디"다. 오타 "한마때"로 읽으면 출석의 선생님 한마디가 리포트에 들어가지 않는다(v2.5.61).
+if grep -rq '선생님 한마때' supabase/functions; then
+  echo "❌ 출석의 선생님 한마디를 오타 속성 이름(한마때)으로 읽고 있습니다."
+  fail=1
+fi
+
+# 학원별 연결 값(Supabase 주소·공개 키)은 hada_config.js 한 파일에만 둔다. 화면 파일에 다시 넣으면 업데이트 때
+# 화면 파일을 통째로 바꿀 수 없고 원본 값이 운영에 섞인다(v2.5.63).
+web_files=$(git ls-files '*.html' '*.js' '*.json' | grep -v '^supabase/' | grep -v '^tests/' | grep -v '^hada_config.js$')
+if grep -lE 'https://[a-z0-9]+.supabase.co|eyJhbGciOi' $web_files 2>/dev/null | grep -q .; then
+  echo "❌ 화면 파일에 Supabase 주소나 공개 키가 직접 들어 있습니다. hada_config.js에서 읽게 하세요:"
+  grep -lE 'https://[a-z0-9]+.supabase.co|eyJhbGciOi' $web_files
+  fail=1
+fi
+for page in student_report.html attendance_kiosk.html legal_documents.html school_search.html library.html admin_settings.html; do
+  if ! grep -q '<script src="hada_config.js"></script>' "$page"; then
+    echo "❌ $page 가 hada_config.js를 불러오지 않습니다."
+    fail=1
+  fi
+done
+
+# 매뉴얼은 패치와 같이 간다(v2.7.17부터). 버전 문서마다 "매뉴얼 영향" 줄이 있어야 하고,
+# "있음"이면 "매뉴얼" 항목이, "없음"이면 무엇을 찾아봤는지("확인:")가 있어야 한다.
+# 이 규칙이 없을 때 v2.7.16의 리포트 변경이 매뉴얼에 빠져 v2.7.18로 따로 맞췄다.
+# 표기는 "매뉴얼"이다. v2.7.x 문서는 옛 표기("메뉴얼")로 남아 있어 두 표기를 모두 받는다.
+for f in docs/updates/v[0-9]*.md; do
+  [ -f "$f" ] || continue
+  ver=$(basename "$f" .md); ver=${ver#v}
+  case "$ver" in *[!0-9.]*) continue ;; esac
+  [ "$(printf '%s
+%s
+' 2.7.17 "$ver" | sort -V | head -1)" = "2.7.17" ] || continue
+  line=$(grep -m1 '^- 매뉴얼 영향:' "$f" || true)
+  if [ -z "$line" ]; then
+    echo "❌ $f 에 '- 매뉴얼 영향:' 줄이 없습니다."
+    fail=1
+  elif echo "$line" | grep -q '있음'; then
+    if ! grep -q '^## 항목 .*[매메]뉴얼' "$f"; then
+      echo "❌ $f 는 매뉴얼 영향이 있음인데 '## 항목 N. 매뉴얼 …' 항목이 없습니다."
+      fail=1
+    fi
+  elif ! echo "$line" | grep -q '확인:'; then
+    echo "❌ $f 의 매뉴얼 영향이 없음이면 무엇을 찾아봤는지 '없음(확인: …)'으로 적으세요."
+    fail=1
+  fi
+done
+
+if [ "$fail" != 0 ]; then
+  echo ""
+  echo "회귀 가드 실패 -- 위 문제를 고친 뒤 다시 배포하세요."
+  exit 1
+fi
+echo "✅ 회귀 가드 통과"

@@ -1,0 +1,185 @@
+// _shared/textbookDistributionTarget.ts
+//
+// sync-textbook-distribution가 처리하는 실제 교재비(장바구니)/교재배부 생성 로직을 별도 파일로 분리했다
+// (2026-09-18, 큐 기반 순차 처리 도입, Phase 2). 원래 index.ts 안에 있던 코드를 그대로 옮긴 것이다.
+// webhook payload 파싱/람다 route 분기는 index.ts에 그대로 둔다. (2026-09-21) 원인 진단용 임시
+// 디버그 로깅(logDebugWebhookCall)과 "🔧 웹훅 디버그 로그 (임시)" DB는 원인 파악(웹훅 주소 오류) 완료 후
+// 함께 제거했다.
+//
+// (2026-09-18) 기존 runWithSafetyTimeout(개별 Edge Function이 응답 없이 멈출 때 정해진 시간 안에
+// 스스로 오류 처리하는 안전장치)은 큐 경로로 이전하지 않았다. 큐에 쌓인 작업은 sync_queue 행으로
+// 영속 저장되고, 워커가 중단돼도 stale 복구 후 다시 처리되므로 개별 함수 내부 타임아웃이 불필요하다.
+//
+// (2026-09-22, PART N-4: 개별 트리거 버튼 동기화 전환) from-cart는 교재비 페이지 1건만 대상으로
+// 하는 개별 트리거라 큐를 거칠 필요가 없다고 판단했다. processFromCartQueueItem(process-sync-queue
+// 전용 진입점)은 제거하고 대신 distributeFromCartPage(pageId만 받는 얇은 래퍼)를 추가했다 --
+// index.ts가 이제 이 함수를 직접 호출한다.
+//
+// (v2.7.11) 예전 /from-cart·/from-class-carts 경로와 반 전체 교재비 큐(processFromClassCartsQueueItem)를 지웠다.
+// 지금은 cartPlan.ts(교재비 [진도교재 담기] 큐)만 distributeFromCartPage를 쓴다.
+
+import { PROP_LAST_ERROR, PROP_SYNCED_AT } from "./constants.ts"
+import { LIBRARY_PROP, libraryIds, libraryPropOf } from "./libraryProp.ts"
+import {
+	getPage,
+	createPage,
+	updatePageProperties,
+	queryAllPages,
+	relIds,
+	relationIds,
+	statusName,
+	anyTitleText,
+	todaySeoulDate,
+} from "./notionClient.ts"
+import type { StatusSpec } from "./statusTracking.ts"
+import { getScheduleConfig } from "./adminShared.ts"
+
+const DATA_SOURCE_TEXTBOOK_CART = Deno.env.get("DATA_SOURCE_TEXTBOOK_CART_ID")! // 교재비(학원) DB
+const DATA_SOURCE_TEXTBOOK_DISTRIBUTION = Deno.env.get("DATA_SOURCE_TEXTBOOK_DISTRIBUTION_ID")! // 교재배부(학원) DB
+
+export const PROP_CART_TITLE = "이름"
+export const PROP_CART_REGISTRATION = "등록"
+
+const PROP_DIST_TITLE = "이름"
+const PROP_DIST_REGISTRATION = "등록"
+const PROP_DIST_DATE = "배부일"
+const PROP_DIST_CART = "교재비"
+
+const PROP_PROGRESS_STATUS = "진행상태"
+const STATUS_ELIGIBLE = "진행 중"
+
+const PROP_REGISTRATION_BOOKS = "진도교재"
+const PROP_REGISTRATION_CART = "교재비"
+
+// (v2.8.0 예체능) 라이브러리 `구분`이 프로그램이면 가격(= 재료비)이 있을 때만 교재비에 담는다.
+// 교재(구분 비어 있음 포함)는 가격과 상관없이 예전처럼 담는다. 교재비 수식 "담기 계획"도 같은 규칙.
+export const PROP_LIBRARY_KIND = "구분"
+export const PROP_LIBRARY_PRICE = "가격"
+export function isBillableLibrary(page: any): boolean {
+	const p = page?.properties ?? {}
+	if (String(p[PROP_LIBRARY_KIND]?.select?.name ?? "") !== "프로그램") return true
+	return Number(p[PROP_LIBRARY_PRICE]?.number ?? 0) > 0
+}
+
+// (2026-09-22, 처리 상태 관리 리팩토링 Phase 3) 기존 setCartStatus(makeSyncStatusSetter(PROP_CART_RUNNING),
+// 체크박스 잠금 + setStatus 콜백)를 상태(select)+처리 시작 시각 방식으로 전환했다. 이 DB에는 이미
+// "삭제 상태"/"교재비 생성 상태"(클래스 DB 쪽) 같은 접두사 붙은 상태 속성들이 있어서, sync-exam-scope
+// 처럼 접두사 없는 "상태"를 쓰면 헷갈릴 수 있다고 판단해 "담기 상태"/"담기 처리 시작 시각"으로 이름을
+// 정했다(cascade-delete의 "삭제 상태"와 같은 명명 관례). index.ts가 runSyncWebhookForPage에
+// statusSpec으로 이 값을 넘기면 markRunning/markDone/markError가 자동으로 처리해준다 — 더 이상 이
+// 파일에 별도 setter 함수가 필요하지 않다. "마지막 동기화"(성공 시각)만은 그 자동 처리 대상이
+// 아니라서, distributeFromCartPage 성공 경로 마지막에 직접 갱신한다(아래, sync-exam-scope와 동일한
+// 패턴). 마스터플랜: https://app.notion.com/p/903c90386c1d473494c5df6306c53517
+export const CART_STATUS_SPEC: StatusSpec = {
+	statusProp: "진도교재 담기 상태",
+	errorProp: PROP_LAST_ERROR,
+	startedAtProp: "진도교재 담기 시작 시각",
+}
+
+// 등록 하나에 대해 교재비(장바구니) 페이지를 확보한다: 이미 있으면 재사용하고, 없으면 생성한다.
+export async function ensureCartForRegistration(
+	registrationId: string,
+	preFetchedRegistration?: any,
+): Promise<{ cartId: string; cartCreated: boolean }> {
+	const registration = preFetchedRegistration ?? (await getPage(registrationId))
+	const existingCartIds = relationIds(registration, PROP_REGISTRATION_CART)
+	if (existingCartIds.length > 0) {
+		return { cartId: existingCartIds[0], cartCreated: false }
+	}
+	const studentName = anyTitleText(registration) || "학생"
+	const textbookConfig = await getScheduleConfig("교재비 안내")
+	const cart = await createPage(DATA_SOURCE_TEXTBOOK_CART, {
+		[PROP_CART_TITLE]: { title: [{ text: { content: `${studentName} 교재비` } }] },
+		[PROP_CART_REGISTRATION]: { relation: [{ id: registrationId }] },
+		...(textbookConfig ? { "알림톡 설정": { relation: [{ id: textbookConfig.rowId }] } } : {}),
+	})
+	return { cartId: cart.id, cartCreated: true }
+}
+
+// 등록 하나에 대해 아직 담기지 않은 "진행 중" 진도교재를 모아, 라이브러리 교재별 교재배부를 개별 생성한다.
+export async function distributeForRegistration(
+	registrationId: string,
+	preFetchedRegistration?: any,
+): Promise<
+	| { status: "no_eligible_books" }
+	| { status: "already_billed" }
+	| { status: "distributed"; distributionPageIds: string[]; bookCount: number; cartId: string; cartCreated: boolean }
+> {
+	const registration = preFetchedRegistration ?? (await getPage(registrationId))
+	const progressBookIds = relationIds(registration, PROP_REGISTRATION_BOOKS)
+	if (progressBookIds.length === 0) return { status: "no_eligible_books" }
+
+	const progressBooks: any[] = []
+	for (const id of progressBookIds) {
+		progressBooks.push(await getPage(id))
+	}
+	const eligibleBookIds = new Set<string>()
+	for (const book of progressBooks) {
+		if (statusName(book, PROP_PROGRESS_STATUS) !== STATUS_ELIGIBLE) continue
+		const regularBookIds = libraryIds(book)
+		if (regularBookIds.length > 0) eligibleBookIds.add(regularBookIds[0])
+	}
+	if (eligibleBookIds.size === 0) return { status: "no_eligible_books" }
+
+	const existingDistributions = await queryAllPages(DATA_SOURCE_TEXTBOOK_DISTRIBUTION, {
+		property: PROP_DIST_REGISTRATION,
+		relation: { contains: registrationId },
+	})
+	const billedBookIds = new Set<string>()
+	for (const dist of existingDistributions) {
+		for (const id of libraryIds(dist)) billedBookIds.add(id)
+	}
+
+	const unbilledIds = [...eligibleBookIds].filter((id) => !billedBookIds.has(id))
+	if (unbilledIds.length === 0) return { status: "already_billed" }
+
+	const newBookIds: string[] = []
+	const newBookPages: any[] = []
+	for (const id of unbilledIds) {
+		const page = await getPage(id)
+		if (!isBillableLibrary(page)) continue
+		newBookIds.push(id)
+		newBookPages.push(page)
+	}
+	if (newBookIds.length === 0) return { status: "no_eligible_books" }
+
+	const { cartId, cartCreated } = await ensureCartForRegistration(registrationId, registration)
+	const distributions: any[] = []
+	const distLibraryProp = newBookIds.length ? await libraryPropOf(DATA_SOURCE_TEXTBOOK_DISTRIBUTION) : LIBRARY_PROP
+	for (let idx = 0; idx < newBookIds.length; idx++) {
+		const bookId = newBookIds[idx]
+		const bookTitle = anyTitleText(newBookPages[idx]) || `${todaySeoulDate()} 교재 배부`
+		const dist = await createPage(DATA_SOURCE_TEXTBOOK_DISTRIBUTION, {
+			[PROP_DIST_TITLE]: { title: [{ text: { content: bookTitle } }] },
+			[PROP_DIST_REGISTRATION]: { relation: [{ id: registrationId }] },
+			[distLibraryProp]: { relation: [{ id: bookId }] },
+			[PROP_DIST_DATE]: { date: { start: todaySeoulDate() } },
+			[PROP_DIST_CART]: { relation: [{ id: cartId }] },
+		})
+		distributions.push(dist)
+	}
+
+	return {
+		status: "distributed",
+		distributionPageIds: distributions.map((d: any) => d.id),
+		bookCount: newBookIds.length,
+		cartId,
+		cartCreated,
+	}
+}
+
+// 교재비 1건 담기. (v2.7.11부터) cartPlan.ts가 본문에 "담기 계획"이 없을 때만 부른다.
+export async function distributeFromCartPage(cartId: string): Promise<void> {
+	const cart = await getPage(cartId)
+	const registrationIds = relationIds(cart, PROP_CART_REGISTRATION)
+	if (registrationIds.length === 0) throw new Error("교재비 페이지에 연결된 등록이 없음")
+	const result = await distributeForRegistration(registrationIds[0])
+	console.log("[sync-textbook-distribution] from-cart finished:", cartId, result)
+
+	// (2026-09-22, Phase 3) 기존 setCartStatus("완료")가 함께 하던 "마지막 동기화" 갱신을 여기로
+	// 옮겼다. 이 줄 이전에 예외가 나면 index.ts 쪽에서 markError로 이어지고 이 줄은 실행되지
+	// 않으므로, 기존과 동일하게 "성공했을 때만" 마지막 동기화가 갱신된다.
+	await updatePageProperties(cartId, {
+		[PROP_SYNCED_AT]: { date: { start: new Date().toISOString() } },
+	})
+}

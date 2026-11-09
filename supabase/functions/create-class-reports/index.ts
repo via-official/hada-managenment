@@ -1,0 +1,109 @@
+// Supabase Edge Function: create-class-reports
+//
+// (v2.8.0) 클래스(학원) DB [보고서 생성] 버튼이 호출한다. 클래스의 '보고서 구분'·'보고서 기간'으로 이 반의 알림톡 발송함을
+// 찾거나 만들고, 기간 안에 다니는 학생마다 보고서를 만든다. 실제 작업은 큐(process-sync-queue)가 한 건씩 한다.
+// 흐름과 건너뛰기 규칙은 _shared/classReportPlan.ts 맨 위 주석.
+//
+// 웹훅 본문에 클래스의 '보고서 구분'·'보고서 기간'·'클래스명'을 실어 보내면(버튼의 "웹훅 보내기" 속성 포함) 누른 순간의 값을
+// 그대로 큐에 담는다. 본문에 없으면 잠금 확인 때 읽은 클래스 페이지 값을 쓴다. 값이 틀리면 만들지 않고 ⚠️ 오류와
+// '마지막 오류'에 고칠 곳을 남긴다. x-admin-key(웹훅 키) 필요.
+//
+// (10/31) 진도 평가 생성 경로(/progress-evaluation·/unit-evaluation·/final-evaluation)는 없앴다. 평가는 수업 기록에서만 만들고
+// 교재를 끝낸 표시는 [수료](/completion)가 한다. 예전 경로로 오면 아무것도 바꾸지 않고 410으로 답한다.
+// (11/02) 발송함 [평가 생성](/evaluations)도 버튼이 없어져 같이 없앴다(같은 410).
+//
+// (v2.8.0 루틴, 항목 18) 경로 /routine-checks: 수업 [루틴 체크 생성]. 이 수업 반의 루틴 × 출석으로 루틴 체크 행을 만든다.
+// 처리는 _shared/routineCheck.ts. 상태는 수업 '루틴 체크 상태'.
+//
+// (v2.8.0 수료, 10/30) 경로 /completion: 진도교재 [수료]. 발송함(수료 보고서)과 학생마다 수료 보고서를 만들고 진도교재를 완료로.
+// 처리는 _shared/completionReport.ts. 상태는 진도교재 '수료 상태'.
+import { authorizeKey, securityEnabled } from "../_shared/adminSecurity.ts"
+import { getCurrentAdminKey, resolveAdminKeyFromRequest } from "../_shared/adminShared.ts"
+import { describeBody, extractPageId, getPage } from "../_shared/notionClient.ts"
+import { respondAccepted } from "../_shared/backgroundTask.ts"
+import { enqueueSync, wakeSyncQueueWorker } from "../_shared/syncQueue.ts"
+import { isRunning, markError, markQueued } from "../_shared/statusTracking.ts"
+import { CLASS_REPORT_GEN_STATUS_SPEC, TARGET_CLASS_REPORTS, reportRequestFromProps, type ClassReportsPayload } from "../_shared/classReportPlan.ts"
+import { ROUTINE_STATUS_SPEC, TARGET_ROUTINE_CHECKS } from "../_shared/routineCheck.ts"
+import { COMPLETION_STATUS_SPEC, TARGET_COMPLETION } from "../_shared/completionReport.ts"
+
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
+
+Deno.serve(async (req: Request) => {
+	if (req.method !== "POST") return new Response("Use POST", { status: 405 })
+	let body: Record<string, unknown> = {}
+	try { body = await req.json() } catch { body = {} }
+	console.log("[create-class-reports] received:", describeBody(body))
+
+	const adminKey = resolveAdminKeyFromRequest(req, body)
+	const currentAdminKey = securityEnabled() ? "" : await getCurrentAdminKey()
+	if (!adminKey || !await authorizeKey(req, adminKey, currentAdminKey)) return json({ error: "unauthorized" }, 401)
+
+	const route = new URL(req.url).pathname.split("/").pop()
+	if (route === "evaluations") return json({ ok: false, error: "발송함 평가 생성은 없어진 기능입니다. 평가는 수업에서 학습기록으로 만들어 주세요." }, 410)
+	if (route === "final-evaluation" || route === "unit-evaluation" || route === "progress-evaluation") return json({ ok: false, error: "진도 평가 생성은 없어진 기능입니다. 교재를 마치면 [수료]를 눌러 주세요." }, 410)
+	if (route === "routine-checks") return await queueRoutineChecks(body)
+	if (route === "completion") return await queueCompletion(body)
+
+	const classId = extractPageId(body)
+	if (!classId) return json({ error: "pageId를 찾을 수 없음" }, 400)
+
+	try {
+		const page = await getPage(classId)
+		// 이미 대기열에 있거나 만드는 중이면 두 번 넣지 않는다(두 번 눌러도 한 번만).
+		if (isRunning(page, CLASS_REPORT_GEN_STATUS_SPEC)) return json({ ok: true, message: "already_processing", classId })
+		const bodyProps = (body.data as Record<string, any> | undefined)?.properties
+		const props = bodyProps && "보고서 구분" in bodyProps && "보고서 기간" in bodyProps ? { 클래스명: page.properties?.["클래스명"], ...bodyProps } : page.properties
+		let payload: ClassReportsPayload
+		try {
+			payload = { classId, ...reportRequestFromProps(props) }
+		} catch (err) {
+			await markError(classId, CLASS_REPORT_GEN_STATUS_SPEC, (err as Error).message)
+			return json({ ok: false, message: (err as Error).message, classId })
+		}
+		await markQueued(classId, CLASS_REPORT_GEN_STATUS_SPEC)
+		await enqueueSync(TARGET_CLASS_REPORTS, payload)
+		wakeSyncQueueWorker()
+		return respondAccepted({ classId, kind: payload.kind, start: payload.start, end: payload.end })
+	} catch (err) {
+		console.error("[create-class-reports] ERROR:", (err as Error).message)
+		await markError(classId, CLASS_REPORT_GEN_STATUS_SPEC, (err as Error).message).catch(() => {})
+		return json({ ok: false, error: (err as Error).message }, 500)
+	}
+})
+
+// 진도교재 [수료]: 잠금 확인 → ⏳ 대기열 → 큐. 학생·발송함 확인은 큐가 한다(_shared/completionReport.ts).
+async function queueCompletion(body: Record<string, unknown>): Promise<Response> {
+	const bookId = extractPageId(body)
+	if (!bookId) return json({ error: "pageId를 찾을 수 없음" }, 400)
+	try {
+		const page = await getPage(bookId)
+		if (isRunning(page, COMPLETION_STATUS_SPEC)) return json({ ok: true, message: "already_processing", bookId })
+		await markQueued(bookId, COMPLETION_STATUS_SPEC)
+		await enqueueSync(TARGET_COMPLETION, { bookId })
+		wakeSyncQueueWorker()
+		return respondAccepted({ bookId, queued: true })
+	} catch (err) {
+		console.error("[create-class-reports/completion] ERROR:", (err as Error).message)
+		await markError(bookId, COMPLETION_STATUS_SPEC, (err as Error).message).catch(() => {})
+		return json({ ok: false, error: (err as Error).message }, 500)
+	}
+}
+
+// 수업 [루틴 체크 생성]: 잠금 확인 → ⏳ 대기열 → 큐. 루틴·출석 확인은 큐가 한다.
+async function queueRoutineChecks(body: Record<string, unknown>): Promise<Response> {
+	const sessionId = extractPageId(body)
+	if (!sessionId) return json({ error: "pageId를 찾을 수 없음" }, 400)
+	try {
+		const page = await getPage(sessionId)
+		if (isRunning(page, ROUTINE_STATUS_SPEC)) return json({ ok: true, message: "already_processing", sessionId })
+		await markQueued(sessionId, ROUTINE_STATUS_SPEC)
+		await enqueueSync(TARGET_ROUTINE_CHECKS, { sessionId })
+		wakeSyncQueueWorker()
+		return respondAccepted({ sessionId, queued: true })
+	} catch (err) {
+		console.error("[create-class-reports/routine-checks] ERROR:", (err as Error).message)
+		await markError(sessionId, ROUTINE_STATUS_SPEC, (err as Error).message).catch(() => {})
+		return json({ ok: false, error: (err as Error).message }, 500)
+	}
+}

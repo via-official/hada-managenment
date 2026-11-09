@@ -1,0 +1,184 @@
+import { authorizeKey, securityEnabled } from "../_shared/adminSecurity.ts"
+// supabase/functions/send-daily-report/index.ts (v5)
+// Sends the daily study-report Kakao AlimTalk for one class day, based on a single
+// row in the attendance (출석) database.
+// - [v5, 2026-09-16] send-class-daily-reports와 100% 중복이던 헬퍼(getEffectiveAdminKey/
+//   getFormulaText/resolveParentPhone/syncStudentReport/sendDailyReportAlimtalk/appendSendLog/
+//   출석 상태 표시 3종)를 _shared/alimtalkShared.ts로 옮기고 이 파일에서는 가져다 씁니다
+//   (로드맵 5-9 공용 모듈화 후속). 동작은 이전과 동일합니다.
+// - [v4] Notion 버튼의 "웹훅 보내기" 액션은 커스텀 HTTP 헤더를 보낼 수 없으므로,
+//   x-admin-key 헤더가 없을 경우 요청 바디의 adminKey 필드도 확인합니다.
+// - [v3] pfId/템플릿ID/발신번호는 이제 "알림톡 설정(학원) DB"에서 조회합니다 (Secrets 값은 기본값으로만 사용).
+// - [v3] 출석 DB의 "전송 완료"가 이제 수식(formula) 속성이므로 더 이상 그 속성을 직접 patch하지 않습니다.
+//   대신 전송로그(학원) DB 행에 "출석" 관계형과 "발송자" 인물 속성을 채워서, 출석 DB의 수식이 그 값을 읽어
+//   자동으로 계산하도록 합니다.
+
+import {
+  createSendLogEntry,
+  extractErrorMessage,
+  getBotUserId,
+  notionGetPage,
+  resolveAdminKeyFromRequest,
+} from "../_shared/adminShared.ts"
+import {
+  getFormulaText,
+  getEffectiveAdminKey,
+  resolveParentPhone,
+  sendDailyReportAlimtalk,
+  appendSendLog,
+  setAttendanceReportSendingFlag,
+  setAttendanceReportLastError,
+  setAttendanceReportCompleteFlag,
+} from "../_shared/alimtalkShared.ts"
+import { runInBackground, respondAccepted } from "../_shared/backgroundTask.ts"
+import { refreshDailyReportForSend } from "../_shared/dailyReportRefresh.ts"
+import { enqueueSync, wakeSyncQueueWorker } from "../_shared/syncQueue.ts"
+import { extractPageId } from "../_shared/notionClient.ts"
+import { formatClassTime } from "../_shared/lessonNotice.ts"
+import { alimtalkVar, arrivalBlock, attendanceBasics, dailyConfigCategory, dailySectionVars, dateOnly, fitDailyLength } from "../_shared/noticeBlocks.ts"
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-admin-key",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders })
+  }
+
+  let body: any
+  try {
+    body = await req.json()
+  } catch (_e) {
+    return new Response(JSON.stringify({ error: "invalid JSON body" }), { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } })
+  }
+
+  const adminKey = resolveAdminKeyFromRequest(req, body)
+  const effectiveAdminKey = securityEnabled() ? "" : await getEffectiveAdminKey()
+  if (!adminKey || !await authorizeKey(req, adminKey, effectiveAdminKey)) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: { "Content-Type": "application/json", ...corsHeaders } })
+  }
+
+  // (v2.6.20) 출석 DB 자동화("보고서 전송 상태"가 ⚪ 대기로 바뀌면)가 부르는 경로. 큐에 넣고 바로 202.
+  // process-sync-queue가 한 건씩 보낸다(_shared/dailyReportQueue.ts). 일괄 전송도 출석마다 이 경로로 온다.
+  if (new URL(req.url).pathname.split("/").pop() === "queue") {
+    const queuedId = extractPageId(body)
+    if (!queuedId) {
+      return new Response(JSON.stringify({ error: "출석 페이지 id를 찾지 못했어요." }), { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } })
+    }
+    const clickerUserId = body?.data?.properties?.["실행자"]?.people?.[0]?.id ?? null
+    await enqueueSync("send-daily-report", { attendanceId: queuedId, clickerUserId })
+    wakeSyncQueueWorker()
+    return respondAccepted({ attendanceId: queuedId, queued: true })
+  }
+
+  const attendanceId: string | null = body?.data?.id ?? body?.attendanceId ?? null
+  const registrationId: string | null = body?.data?.properties?.["등록"]?.relation?.[0]?.id ?? body?.registrationId ?? null
+  if (!registrationId || !attendanceId) {
+    return new Response(JSON.stringify({ error: "registrationId, attendanceId required" }), { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } })
+  }
+
+  await setAttendanceReportSendingFlag(attendanceId, true)
+
+  // [NEW, 2026-09-23, PART N-7: 개별 버튼 응답 지연 해소] Notion "웹훅 보내기" 버튼이 아래 전체
+  // 동기 처리(보고서 캐시 동기화 + 알림톡 발송 + 로그 기록)를 기다리다 시간 초과로 "실행 실패" 토스트를
+  // 띄우는 사례가 있었다 (실제로는 끝까지 정상 완료되어 카카오 메시지가 도착함 -- fix-attendance/종료
+  // 처리와 동일한 원인). 이 함수는 다른 함수가 HTTP로 호출하는 경우가 없어(개별 "보고서 전송" 버튼
+  // 전용) send-report처럼 동기/비동기 분기를 둘 필요 없이 전부 백그라운드로 옮긴다. "전송중" 표시는
+  // 응답 전에 이미 동기로 켜 두었으므로 그대로 진행 상황을 보여준다.
+  runInBackground(async () => {
+    try {
+      // 이미 전송한 건은 무거운 출석/캐시 최신화 전에 먼저 걸러낸다.
+      const attendancePage = await notionGetPage(attendanceId)
+      const basics = attendanceBasics(attendancePage)
+      const studentName = basics.studentName
+
+      const alreadySent = attendancePage.properties?.["전송완료 체크"]?.checkbox === true
+      if (alreadySent) {
+        await setAttendanceReportLastError(attendanceId, "이미 전송 완료된 건입니다. 다시 보내려면 '전송완료 체크'를 해제한 뒤 버튼을 눌러주세요.")
+        await setAttendanceReportSendingFlag(attendanceId, false)
+        return
+      }
+
+      // 토큰 발급 -> 출석 원본 동기화 -> 학습기록/학습활동을 포함한 보고서 캐시 생성이
+      // 모두 성공한 뒤에만 알림톡을 보낸다. 최신화 실패 시 아래 catch로 이동해 전송하지 않는다.
+      const { access_token, reportUrl } = await refreshDailyReportForSend(registrationId)
+
+      const className = basics.className
+      const attendanceStatus = basics.status
+      // (v2.8.0 통일안) 새 템플릿의 #{등원정보}: 날짜는 수식을 읽지 않고(API의 수식 날짜는 UTC) 출석 수업일시로 서울 날짜를 만든다.
+      // 보강 출석이면 기존 결석의 수업일 줄을 앞에 붙인다. 못 읽으면 그 줄 없이.
+      const makeupId = attendancePage.properties?.["기존 결석"]?.relation?.[0]?.id
+      const makeupPage = makeupId ? await notionGetPage(makeupId).catch(() => null) : null
+      const makeupIso = String(makeupPage?.properties?.["수업일시"]?.date?.start ?? "")
+      const arrival = arrivalBlock({
+        classDate: dateOnly(formatClassTime(attendancePage.properties?.["수업일시"]?.date?.start)),
+        status: attendanceStatus,
+        makeupOf: makeupIso ? dateOnly(formatClassTime(makeupIso)) : undefined,
+      })
+
+      const parentPhone = await resolveParentPhone(attendancePage, registrationId)
+
+      const REPORT_PATH = Deno.env.get("REPORT_PATH") ?? "/academy-management/student_report.html"
+      const tokenQueryString = REPORT_PATH + "?token=" + access_token
+      // 변수 값은 "변수(알림톡)" 수식 → 없으면 서버 계산. 보낼 때 그 템플릿에 있는 것만 남긴다(_shared/templateFit.ts).
+      const variables: Record<string, string> = fitDailyLength({
+        "#{학생이름}": alimtalkVar(attendancePage, "학생이름", studentName),
+        "#{클래스}": alimtalkVar(attendancePage, "클래스", className),
+        "#{등원정보}": arrival,
+        // (v2.8.0 루틴) 루틴 구역은 '학습내용(알림톡)' 수식이 만든다. 수식이 없거나 비었을 때만 서버가 같은 모양으로.
+        // (v2.8.0 구역) 일일 학습·활동 보고서의 구역 변수. 출석 (알림톡) 수식을 따른다.
+        ...dailySectionVars(attendancePage, attendanceStatus),
+        "#{페이지ID}": tokenQueryString,
+      })
+      const configCategory = await dailyConfigCategory(attendancePage, (id) => notionGetPage(id))
+
+      const clickerUserId =
+        body?.data?.properties?.["실행자"]?.people?.[0]?.id ??
+        attendancePage.properties?.["실행자"]?.people?.[0]?.id ??
+        null
+      const botUserId = clickerUserId ?? (await getBotUserId().catch(() => null))
+
+      let sendResult: unknown
+      try {
+        sendResult = await sendDailyReportAlimtalk({ registrationId, primaryPhone: parentPhone, variables, configCategory })
+      } catch (sendErr) {
+        await createSendLogEntry({
+          registrationId,
+          attendanceId,
+          senderUserId: botUserId ?? undefined,
+          title: studentName || "일일 보고서",
+          category: "일일 보고서",
+          status: "실패",
+          failReason: extractErrorMessage(sendErr),
+        })
+        throw sendErr
+      }
+
+      await appendSendLog(attendancePage)
+      await createSendLogEntry({
+        registrationId,
+        attendanceId,
+        senderUserId: botUserId ?? undefined,
+        title: studentName || "일일 보고서",
+        category: "일일 보고서",
+        status: "성공",
+      })
+
+      await setAttendanceReportLastError(attendanceId, null)
+      await setAttendanceReportCompleteFlag(attendanceId, true)
+      await setAttendanceReportSendingFlag(attendanceId, false)
+
+      // 리포트 토큰·링크·발송 응답(수신 번호가 들어 있을 수 있음)은 로그에 남기지 않는다(v2.7.19).
+      console.log("send-daily-report finished:", attendanceId)
+    } catch (err) {
+      console.error("send-daily-report background 처리 실패:", attendanceId, (err as Error).message)
+      await setAttendanceReportLastError(attendanceId, extractErrorMessage(err))
+      await setAttendanceReportSendingFlag(attendanceId, false)
+    }
+  })
+
+  return respondAccepted({ attendanceId })
+})
