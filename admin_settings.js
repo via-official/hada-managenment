@@ -12,7 +12,8 @@ try{if(!session)session=sessionStorage.getItem(legacySessionKey)||'';sessionStor
 function text(id,value){$(id).textContent=value;}
 // kind: info(평소 안내·연결 상태) / success(사용자가 한 일이 끝남) / warn(주의, 노랑) / error(실패) — docs/DESIGN.md 알림 줄
 function notice(message,kind='info'){text('connection-status',message);['info','success','error'].forEach(k=>$('connection-status').classList.toggle(k,k===kind));}
-function friendly(e){return e instanceof TypeError||e.name==='TimeoutError'||e.name==='AbortError'?'인증 서버에 연결하지 못했습니다. 연결 설정과 네트워크를 확인해 주세요.':(e.message||'처리하지 못했습니다.');}
+// 시간 초과(오래 걸림)와 연결 실패(응답 없음)를 나눠 알린다. 큰 학원의 예시 데이터 확인은 오래 걸릴 수 있다.
+function friendly(e){if(e.name==='TimeoutError'||e.name==='AbortError')return '서버 응답이 오래 걸려 기다림을 멈췄습니다. 잠시 뒤 다시 눌러 주세요. 예시 데이터가 아주 많으면 이식 체크리스트 5장의 GitHub Actions로 비웁니다.';return e instanceof TypeError?'인증 서버에 연결하지 못했습니다. 연결 설정과 네트워크를 확인해 주세요.':(e.message||'처리하지 못했습니다.');}
 function error(message){text('form-error',message);$('form-error').hidden=!message;}
 function panel(id,title,description){forms.forEach(x=>$(x).hidden=x!==id);$('logout').hidden=id!=='dashboard';text('panel-title',title);text('panel-description',description);error('');$('retry').hidden=true;$('main-card').classList.toggle('centered',!!id&&!['dashboard','webhook-progress','clear-panel'].includes(id));if(id!=='clear-panel')stopClearPoll();}
 function clearPasswords(){document.querySelectorAll('input[type=password]').forEach(x=>x.value='');$('new-webhook-key').value='';}
@@ -34,7 +35,7 @@ function clearSummary(s){
  const f=s.flag;
  if(f&&f.state==='done')return [`${date(f.finishedAt||s.updatedAt)}에 비웠습니다(${(f.done||0).toLocaleString()}건). 이 기능은 잠겼습니다.`,false];
  if(f&&f.state==='locked')return ['이미 쓰고 있는 학원이라 잠겨 있습니다. 실제 데이터를 지우지 않도록 막아 둔 것입니다.',false];
- if(f&&f.state==='running'&&!s.canStart)return [`비우는 중입니다: ${f.done||0} / ${f.total||0}건${f.current?` · ${f.current}`:''}`,true];
+ if(f&&f.state==='running'&&!s.canStart)return [`비우는 중입니다: ${f.done||0} / ${f.total||0}${f.totalCapped?'+':''}건${f.current?` · ${f.current}`:''}`,true];
  if(f&&f.state==='stopped')return [`중단했습니다(${f.done||0}건 지움). 다시 시작하면 남은 것만 지웁니다.`,true];
  if(f&&(f.state==='error'||f.state==='running'))return [`멈췄습니다${f.error?`: ${f.error}`:''}. 다시 시작하면 남은 것만 지웁니다.`,true];
  return ['아직 비우지 않았습니다. 설치를 시작할 때 한 번 비웁니다.',true];
@@ -46,7 +47,7 @@ async function loadClearState(){
 function showClearProgress(s){
  const f=s.flag||{};const total=f.total||0,done=f.done||0;
  $('clear-progress').hidden=false;$('clear-bar').style.width=total?`${Math.min(100,Math.round(done*100/total))}%`:'0%';
- text('clear-count',`${done} / ${total}건${f.current?` · ${f.current}`:''}`);
+ text('clear-count',`${done} / ${total}${f.totalCapped?'+':''}건${f.current?` · ${f.current}`:''}`);
  $('clear-stop').hidden=f.state!=='running';
 }
 // After a finished (or locked) run the server no longer counts pages, so the list would show 0 for every DB, kept ones
@@ -81,7 +82,7 @@ function updateClearTotal(){
  const boxes=clearChecks(),on=boxes.filter(b=>b.checked);
  const all=$('clear-all');all.checked=on.length===boxes.length&&boxes.length>0;all.indeterminate=on.length>0&&on.length<boxes.length;
  document.querySelectorAll('#clear-dbs .clear-group').forEach(g=>{const items=[...g.querySelectorAll('.clear-list input')],n=items.filter(b=>b.checked).length,gb=g.querySelector('.clear-group-head input');gb.checked=n===items.length;gb.indeterminate=n>0&&n<items.length;});
- text('clear-workspace',`이 학원 워크스페이스: ${clearWorkspace||'(이름 없음)'} · 고른 DB ${on.length}개 · 비울 페이지 ${on.reduce((s,b)=>s+Number(b.dataset.count),0)}건`);
+ text('clear-workspace',`이 학원 워크스페이스: ${clearWorkspace||'(이름 없음)'} · 고른 DB ${on.length}개 · 비울 페이지 ${on.reduce((s,b)=>s+Number(b.dataset.count),0)}${on.some(b=>b.dataset.capped)?'+':''}건`);
 }
 let clearWorkspace='';
 // The DB's own Notion icon: a built-in Notion icon image or an emoji; nothing for uploaded images (their links expire).
@@ -96,11 +97,11 @@ async function openClear(){
  const groups=new Map();for(const d of s.dbs){if(!groups.has(d.group))groups.set(d.group,{required:d.required,dbs:[]});groups.get(d.group).dbs.push(d);}
  for(const [name,g] of groups){
   const wrap=el('section',`clear-group ${g.required?'req':'opt'}`),head=el('label','clear-group-head'),gbox=el('input'),ul=el('ul','clear-list');gbox.type='checkbox';
-  head.append(gbox,el('span','',name),el('b',`tag ${g.required?'req':'opt'}`,g.required?'필수':'선택'),el('span','muted',`${g.dbs.reduce((t,d)=>t+d.count,0)}건`));
+  head.append(gbox,el('span','',name),el('b',`tag ${g.required?'req':'opt'}`,g.required?'필수':'선택'),el('span','muted',`${g.dbs.reduce((t,d)=>t+d.count,0)}${g.dbs.some(d=>d.capped)?'+':''}건`));
   gbox.onchange=()=>{ul.querySelectorAll('input').forEach(b=>{b.checked=gbox.checked;});updateClearTotal();};
-  for(const d of g.dbs){const li=el('li'),label=el('label'),box=el('input');box.type='checkbox';box.checked=d.checked;box.dataset.name=d.name;box.dataset.count=String(d.count);box.dataset.required=d.required?'1':'';box.onchange=updateClearTotal;
+  for(const d of g.dbs){const li=el('li'),label=el('label'),box=el('input');box.type='checkbox';box.checked=d.checked;box.dataset.name=d.name;box.dataset.count=String(d.count);if(d.capped)box.dataset.capped='1';box.dataset.required=d.required?'1':'';box.onchange=updateClearTotal;
    label.classList.toggle('off',!d.checked);box.addEventListener('change',()=>label.classList.toggle('off',!box.checked));
-   label.append(box,dbIcon(d.icon),el('span','',d.name.replace('(학원) DB','')),el('span','muted',`${d.count}건`));li.append(label);ul.append(li);}
+   label.append(box,dbIcon(d.icon),el('span','',d.name.replace('(학원) DB','')),el('span','muted',`${d.count}${d.capped?'+':''}건`));li.append(label);ul.append(li);}
   wrap.append(head,ul);list.append(wrap);}
  updateClearTotal();
  text('clear-keep',`항상 남기는 DB: ${s.keep.map(n=>n.replace('(학원) DB','')).join(' · ')||'없음'} · 체크를 푼 DB와 매뉴얼 페이지·DB 템플릿도 그대로입니다.`);

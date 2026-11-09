@@ -999,6 +999,17 @@ body:not(.reg-expanded) .cal-hint { animation: calExtraFadeIn 0.26s ease both; }
 .log-card.평가 .log-pill, .log-row.평가 .log-pill { color: var(--success-ink); }
 .log-pill.tone-submit { background: var(--info-soft) !important; color: var(--info-ink) !important; }
 .log-pill.tone-late, .log-pill.tone-red { color: var(--danger-ink) !important; }
+/* 루틴 O·X 원 배지(일간 보고서): 했음 = 연파랑 바탕·파란 동그라미, 안 함 = 연빨강 바탕·빨간 엑스. 줄 오른쪽 끝 */
+.ox-badge { flex: none; margin-left: auto; width: 30px; height: 30px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; }
+.ox-badge svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2.6; stroke-linecap: round; }
+.ox-badge.ox-done { background: var(--info-soft); color: var(--info-ink); }
+.ox-badge.ox-miss { background: var(--danger-soft); color: var(--danger-ink); }
+.ox-badge.ox-empty { background: var(--brand-soft); }
+/* 홈 "오늘" 칸 루틴 줄: 요약 칸 아래, 이름 왼쪽·O·X 배지 오른쪽 */
+.home-routines { margin-top: 12px; border-top: 1px solid #f1f0f6; }
+.home-routine { display: flex; align-items: center; gap: 8px; min-height: 44px; font-size: 14px; font-weight: 700; border-bottom: 1px solid #f1f0f6; }
+.home-routine:last-child { border-bottom: 0; }
+.home-routine > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 점수 4구간: 90 이상 초록 · 70 이상 노랑 · 50 이상 주황 · 50 미만 빨강 */
 .log-pill.tone-green { background: var(--success-soft) !important; color: var(--success-ink) !important; }
 .log-pill.tone-yellow { background: var(--warning-soft) !important; color: var(--warning-ink) !important; }
@@ -1092,6 +1103,6 @@ body:not(.reg-expanded) .cal-hint { animation: calExtraFadeIn 0.26s ease both; }
 
 <script src="hada_config.js"></script>
 <script src="student_report_part1.js?v=1a5f971d"></script>
-<script src="student_report_part2.js?v=eb858db5"></script>
+<script src="student_report_part2.js?v=4a945bc4"></script>
 </body>
 </html>

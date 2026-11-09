@@ -87,6 +87,11 @@ const OLD_NAME = CLEAR_DBS[CLEAR_DBS.length - 1]
 const BATCH = 25
 const ITEM_BUDGET_MS = 60_000
 const PAUSE_MS = 350
+// (11/9 비아 1만 5천 건) 건수는 DB마다 COUNT_CAP건까지만 세고(넘으면 "1000+"), 동시에 COUNT_PARALLEL개씩, 전체 COUNT_BUDGET_MS 안에서만 센다.
+// 예전에는 모든 DB의 페이지를 끝까지 차례로 세어 큰 학원에서 함수 시간 한도(150초)·화면 대기(90초)를 넘겼다.
+export const COUNT_CAP = 1000
+const COUNT_PARALLEL = 3
+const COUNT_BUDGET_MS = 50_000
 // 진행 중인데 이 시간 동안 소식이 없으면 멈춘 것으로 보고 다시 시작할 수 있게 한다.
 export const STALE_MS = 20 * 60_000
 
@@ -100,13 +105,16 @@ export type ClearState = {
   done?: number
   current?: string
   passes?: number
+  // total이 아래 한계(건수 상한·시간 안에 못 센 DB)라 실제보다 적을 수 있음.
+  totalCapped?: boolean
   keep?: string[]
   error?: string
   startedAt?: string
   finishedAt?: string
   at?: string
 }
-export type StatusDb = { name: string; count: number; checked: boolean; group: string; required: boolean; icon: DbIcon }
+// capped: count가 상한(COUNT_CAP) 또는 시간 안에 못 세어 실제보다 적을 수 있음(화면은 "n+건").
+export type StatusDb = { name: string; count: number; capped?: boolean; checked: boolean; group: string; required: boolean; icon: DbIcon }
 // 화면에 그릴 DB 아이콘. Notion 기본 아이콘은 notion.so/icons 그림 주소, 이모지는 글자. 직접 올린 그림(주소가 만료됨)은 넣지 않는다.
 export type DbIcon = { emoji: string } | { url: string } | null
 export type ClearStatus = {
@@ -253,21 +261,45 @@ async function pageIds(ds: string, limit = Infinity): Promise<string[]> {
   return ids.slice(0, limit)
 }
 
+// DB(이름)별 건수. 데이터 소스마다 COUNT_CAP+1건까지만 읽고, COUNT_PARALLEL개씩 동시에, COUNT_BUDGET_MS가 지나면 남은 소스는 세지 않는다.
+// 상한에 닿았거나 못 센 소스가 있는 이름은 capped. read는 시험에서 바꿔 끼운다.
+export async function countPlan(
+  plan: PlanItem[],
+  read: (ds: string, limit: number) => Promise<string[]> = pageIds,
+  opts: { cap?: number; parallel?: number; budgetMs?: number } = {},
+): Promise<Map<string, { count: number; capped: boolean }>> {
+  const cap = opts.cap ?? COUNT_CAP, parallel = opts.parallel ?? COUNT_PARALLEL, budget = opts.budgetMs ?? COUNT_BUDGET_MS
+  const out = new Map<string, { count: number; capped: boolean }>()
+  for (const p of plan) if (!out.has(p.name)) out.set(p.name, { count: 0, capped: false })
+  const started = Date.now()
+  let next = 0
+  const worker = async () => {
+    while (next < plan.length) {
+      const p = plan[next++]
+      const row = out.get(p.name)!
+      if (Date.now() - started > budget) { row.capped = true; continue }
+      const n = (await read(p.ds, cap + 1)).length
+      row.count += Math.min(n, cap)
+      if (n > cap) row.capped = true
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(parallel, plan.length) }, worker))
+  return out
+}
+
 export async function status(): Promise<ClearStatus> {
   const [{ value, updatedAt }, workspace, sources] = await Promise.all([readFlag(), workspaceName(), dataSources()])
   // 지난번에 남긴 DB(원본 리허설의 업데이트 DB 등)는 처음부터 체크를 풀어 둔다.
   const keep = value?.keep ?? []
   const { plan, missing, unknown } = buildPlan(sources)
-  const counts = new Map<string, number>()
   // 이미 끝났거나 잠긴 뒤에는 세지 않는다(화면은 잠김만 보여 준다).
-  if (canStart(value, updatedAt)) {
-    for (const p of plan) counts.set(p.name, (counts.get(p.name) ?? 0) + (await pageIds(p.ds)).length)
-  }
+  const counts = canStart(value, updatedAt) ? await countPlan(plan) : new Map<string, { count: number; capped: boolean }>()
   const planned = new Map([...new Set(plan.map((p) => p.name))].map((n) => [n, sources.get(n) ?? []]))
   const icons = await iconsOf(planned, dsIcon).catch(() => new Map<string, DbIcon>())
   const dbs = [...planned.keys()].map((name) => {
     const g = groupOf(name)
-    return { name, count: counts.get(name) ?? 0, checked: !keep.includes(name), group: g?.name ?? "기타", required: g?.required ?? false, icon: icons.get(name) ?? null }
+    const c = counts.get(name)
+    return { name, count: c?.count ?? 0, capped: c?.capped ?? false, checked: !keep.includes(name), group: g?.name ?? "기타", required: g?.required ?? false, icon: icons.get(name) ?? null }
   })
   return {
     workspace, flag: value, updatedAt, dbs, total: dbs.filter((d) => d.checked).reduce((s, d) => s + d.count, 0),
@@ -288,9 +320,11 @@ export async function start(confirmWorkspace: string, selected: unknown): Promis
   const workspace = await workspaceName()
   if (!workspace || confirmWorkspace.trim() !== workspace) throw new ClearError(400, "워크스페이스 이름이 맞지 않습니다. 지우지 않았습니다.")
   const { plan } = buildPlan(await dataSources(), keep)
-  let total = 0
-  for (const p of plan) total += (await pageIds(p.ds)).length
-  const state: ClearState = { state: "running", workspace, keep, plan, total, done: 0, current: plan[0]?.name ?? "", passes: 1, startedAt: new Date().toISOString() }
+  // 시작할 때는 상한·시간 안에서만 센다(지우는 일은 대기열이 DB마다 끝까지 한다). total은 진행 표시용 아래 한계일 수 있다.
+  const counts = await countPlan(plan)
+  const total = [...counts.values()].reduce((s, c) => s + c.count, 0)
+  const totalCapped = [...counts.values()].some((c) => c.capped)
+  const state: ClearState = { state: "running", workspace, keep, plan, total, totalCapped, done: 0, current: plan[0]?.name ?? "", passes: 1, startedAt: new Date().toISOString() }
   await writeFlag(state)
   await enqueueSync(TARGET_EXAMPLE_CLEAR, { step: 0 })
   wakeSyncQueueWorker()

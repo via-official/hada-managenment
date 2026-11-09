@@ -848,7 +848,7 @@ function buildHomeTabHtml(r) {
           <div class="home-stat ${attTone}"><b>${esc(attText)}</b><small>출석</small></div>
           <div class="home-stat ${pending.length ? "bad" : ""}"><b>${pending.length}개</b><small>남은 과제</small></div>
           <div class="home-stat"><b>${esc(nextClassInfo(r))}</b><small>다음 수업</small></div>
-        </div>
+        </div>${homeRoutineHtml(r)}
       </div>
       <h3 class="sec-title"><span class="sec-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg></span>남은 과제</h3>
       <div class="card">${pending.length ? pending.slice(0, 3).map((h) => kindBlockHtml("과제", { title: [h.book, h.range].filter(Boolean).join(" · ") || "과제", pill: h.status, pillTone: homeworkPillTone(h.status), sub: `마감 ${shortDateDow(h.due)}` })).join("") : `<div class="empty">남은 과제가 없어요.</div>`}</div>`}
@@ -1424,10 +1424,10 @@ function buildDailyBodyHtml(r, date) {
     groupBand(todaysTests, (t) => reportItemHtml(r, t, { pill: testPillText(t), pillTone: testPillTone(t), leadRows: testEvalRow(t) ? [testEvalRow(t)] : [], extraRows: testScoreRows(t) }), "이날 평가가 없어요.") +
     sub(TREND_TITLE.day) +
     band(buildTestTrendChartHtml(computePeriodTrendPoints(dailyTests, "day", date)))
-  // (v2.8.0 루틴) 그날 루틴: 했으면 "했어요", 아니면 "안 했어요". 루틴을 안 쓰는 반은 칸이 없다.
+  // (v2.8.0 루틴) 그날 루틴: 알림톡과 같은 O·X를 오른쪽 원 배지로(했음 파랑 동그라미, 안 함 빨강 엑스). 화면읽기는 "했어요"/"안 했어요". 루틴을 안 쓰는 반은 칸이 없다.
   const todaysRoutines = (r.routines || []).filter((x) => x.date === date)
   const routineHtml = todaysRoutines.length
-    ? groupBand(todaysRoutines, (x) => `<div class="rep-item"><div class="rep-title">${esc(x.name)}<span class="log-pill ${homeworkPillTone(x.done ? "제출" : "미제출")}">${x.done ? "했어요" : "안 했어요"}</span></div></div>`, "")
+    ? groupBand(todaysRoutines, (x) => `<div class="rep-item"><div class="rep-title">${esc(x.name)}${routineOxBadge(x.done)}</div></div>`, "")
     : empty("이날 루틴 체크가 없어요.")
   const commentHtml = comment
     ? band(`<div class="speech">${esc(comment.text)}${comment.by ? `<small>${esc(comment.by)}</small>` : ""}</div>`)
@@ -1711,3 +1711,24 @@ window.addEventListener("popstate", (e) => {
 })
 
 initApp()
+
+// (v2.8.0 루틴) 일간 보고서 루틴 O·X 원 배지. 색은 제출·미제출 알약과 같은 연한 바탕·진한 의미색.
+function routineOxBadge(done) {
+  const mark = done
+    ? '<circle cx="12" cy="12" r="7"></circle>'
+    : '<path d="M7 7l10 10M17 7L7 17"></path>'
+  const label = done ? "했어요" : "안 했어요"
+  return `<span class="ox-badge ${done ? "ox-done" : "ox-miss"}" role="img" aria-label="${label}"><svg viewBox="0 0 24 24" aria-hidden="true">${mark}</svg></span>`
+}
+
+// (v2.8.0 루틴) 홈 "오늘" 칸 루틴: 오늘 체크가 있으면 일간 보고서와 같은 O·X 원 배지, 없으면 가장 최근 체크한 날의 루틴 이름만(배지 자리는 빈 원).
+// 루틴을 안 쓰는 반(체크가 한 번도 없음)은 줄이 없다.
+function homeRoutineHtml(r) {
+  const all = (r.routines || []).filter((x) => x.date <= MOCK_TODAY)
+  if (!all.length) return ""
+  const todays = all.filter((x) => x.date === MOCK_TODAY)
+  const lastDate = all.reduce((m, x) => (x.date > m ? x.date : m), "")
+  const rows = todays.length ? todays : [...new Map(all.filter((x) => x.date === lastDate).map((x) => [x.name, { name: x.name }])).values()]
+  const badge = (x) => todays.length ? routineOxBadge(x.done) : `<span class="ox-badge ox-empty" role="img" aria-label="오늘 체크 전"></span>`
+  return `<div class="home-routines">${rows.map((x) => `<div class="home-routine"><span>${esc(x.name)}</span>${badge(x)}</div>`).join("")}</div>`
+}
