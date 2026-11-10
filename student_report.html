@@ -852,6 +852,8 @@ body:not(.reg-expanded) .cal-hint { animation: calExtraFadeIn 0.26s ease both; }
 .letter-action { display: block; width: 100%; min-height: 44px; margin-top: 16px; border: 0; border-radius: 10px; background: #F5EFE7; color: #3F372F; font: inherit; font-size: 14px; font-weight: 700; cursor: pointer; }
 /* 선생님 한마디 카드: 한마디 없이 본문만 있으면 옅은 안내 한 줄. 수료 구역의 보고서 본문은 가정통신문 본문과 같은 카드, 비면 자리도 남기지 않는다 */
 .teacher-card .speech.muted { color: var(--text-muted); }
+/* 한마디 → 작은 글씨는 6(눈으로 약 11): 작은 글씨가 한마디에 붙고, 펼친 칸(14)과는 한 단계 떨어져 보이게 */
+.teacher-card > .log-meta { margin-top: 6px; }
 .report-body:empty { display: none; }
 .completion-detail .card + .report-body > .rep-sub:first-child { margin-top: 18px; }
 .completion-detail .report-body > :last-child { margin-bottom: 0; }
