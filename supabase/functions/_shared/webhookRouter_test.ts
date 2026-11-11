@@ -1,6 +1,6 @@
 // 웹훅 길잡이 시험: 연결표가 관리자 설정 체크리스트와 같은지, 동작 ID를 제대로 뽑는지, 기존 함수로 그대로 넘기는지.
 import { WEBHOOK_ROUTES, resolveActions, routeById, targetUrl } from "./webhookRoutes.ts"
-import { handleRouter, type RouterDeps } from "./webhookRouter.ts"
+import { handleRouter, processRouterRetryItem, ROUTER_MISS_TARGET, ROUTER_RETRY_TARGET, type RouterDeps } from "./webhookRouter.ts"
 
 function assert(cond: unknown, msg = "assertion failed"): asserts cond { if (!cond) throw new Error(msg) }
 const eq = (a: unknown, b: unknown, msg?: string) => assert(JSON.stringify(a) === JSON.stringify(b), `${msg ?? ""} ${JSON.stringify(a)} !== ${JSON.stringify(b)}`)
@@ -32,8 +32,8 @@ Deno.test("주소: 경로·쿼리 붙이기", () => {
   eq(targetUrl("https://x.supabase.co", routeById("cart-progress-book")!), "https://x.supabase.co/functions/v1/sync-textbook-distribution/from-cart/queue")
 })
 
-function deps(over: Partial<RouterDeps> & { calls?: any[]; status?: number | ((url: string) => number) } = {}): RouterDeps {
-  const calls = over.calls ?? []
+function deps(over: Partial<RouterDeps> & { calls?: any[]; queued?: any[]; failures?: any[]; status?: number | ((url: string) => number); enqueueThrows?: boolean } = {}): RouterDeps {
+  const calls = over.calls ?? [], queued = over.queued ?? [], failures = over.failures ?? []
   return {
     fetch: (async (url: string, init: RequestInit) => {
       calls.push({ url, headers: init.headers, body: init.body })
@@ -45,6 +45,8 @@ function deps(over: Partial<RouterDeps> & { calls?: any[]; status?: number | ((u
     currentKey: async () => "k",
     authorize: over.authorize ?? (async (_r, p, l) => p === l),
     log: () => {},
+    enqueue: async (target, payload) => { if (over.enqueueThrows) throw new Error("db down"); queued.push({ target, payload }) },
+    recordFailure: async (target, payload, message) => { failures.push({ target, payload, message }) },
   }
 }
 const req = (body: unknown, headers: Record<string, string> = {}, q = "") =>
@@ -80,17 +82,70 @@ Deno.test("?a= 주소 꼬리와 헤더를 합침", async () => {
   eq(res.status, 202); eq(calls.length, 2)
 })
 
-Deno.test("동작이 없으면 400", async () => {
-  const res = await handleRouter(req({ data: { id: "p" } }), deps())
-  eq(res.status, 400)
+Deno.test("동작이 없으면 200(Notion이 자동화를 멈추지 않게) + 실패 한 줄 기록, 아무것도 넘기지 않음", async () => {
+  const calls: any[] = [], failures: any[] = []
+  const body = { source: { type: "automation", automation_id: "a1" }, data: { id: "p", properties: { "학생": "비밀" } } }
+  const res = await handleRouter(req(body, {}, "?a=no-such-action"), deps({ calls, failures }))
+  eq(res.status, 200); eq(calls.length, 0)
+  eq((await res.json()).ok, false)
+  eq(failures.length, 1); eq(failures[0].target, ROUTER_MISS_TARGET)
+  eq(failures[0].payload, { pageId: "p", automationId: "a1", unknown: ["no-such-action"] }, "본문은 남기지 않음")
+  assert(failures[0].message.includes("no-such-action"))
 })
 
-Deno.test("넘기기 실패(5xx·네트워크)면 502 — Notion이 다시 보냄. 4xx는 함수가 판단한 것이라 202", async () => {
-  eq((await handleRouter(req({}, { "x-hada-action": "reg-report-sync" }), deps({ status: 500 }))).status, 502)
-  eq((await handleRouter(req({}, { "x-hada-action": "reg-report-sync" }), deps({ status: 0 }))).status, 502)
-  eq((await handleRouter(req({}, { "x-hada-action": "reg-report-sync" }), deps({ status: 400 }))).status, 202)
-  const mixed = await handleRouter(req({}, { "x-hada-action": "reg-report-sync,reg-link-regenerate" }), deps({ status: (u) => u.includes("toggle") ? 503 : 202 }))
-  eq(mixed.status, 502)
+Deno.test("모르는 ID가 섞이면 아는 것은 넘기고 모르는 것은 기록", async () => {
+  const calls: any[] = [], failures: any[] = []
+  const res = await handleRouter(req({ data: { id: "p" } }, { "x-hada-action": "reg-report-sync,nope" }), deps({ calls, failures }))
+  eq(res.status, 202); eq(calls.length, 1); eq(failures.length, 1)
+})
+
+Deno.test("실패 기록이 안 돼도 200(기록 실패로 Notion을 멈추지 않음)", async () => {
+  const d = deps(); d.recordFailure = async () => { throw new Error("db down") }
+  eq((await handleRouter(req({ data: { id: "p" } }), d)).status, 200)
+})
+
+Deno.test("넘기기 실패(5xx·네트워크)면 그 동작만 다시 넘기기 큐에 넣고 202. 4xx는 함수가 판단한 것이라 그대로 202", async () => {
+  for (const st of [500, 0]) {
+    const queued: any[] = []
+    const res = await handleRouter(req({ data: { id: "p" } }, { "x-hada-action": "reg-report-sync" }), deps({ status: st, queued }))
+    eq(res.status, 202); eq(queued.length, 1)
+    eq(queued[0].target, ROUTER_RETRY_TARGET); eq(queued[0].payload.id, "reg-report-sync"); eq(queued[0].payload.pageId, "p")
+    eq(queued[0].payload.body, JSON.stringify({ data: { id: "p" } }), "본문 그대로")
+    assert(!("key" in queued[0].payload) && !JSON.stringify(queued[0].payload).includes('"k"'), "키는 저장하지 않음")
+    eq((await res.json()).ok, false)
+  }
+  const q400: any[] = []
+  eq((await handleRouter(req({}, { "x-hada-action": "reg-report-sync" }), deps({ status: 400, queued: q400 }))).status, 202)
+  eq(q400.length, 0)
+  const queued: any[] = []
+  const mixed = await handleRouter(req({}, { "x-hada-action": "reg-report-sync,reg-link-regenerate" }), deps({ queued, status: (u) => u.includes("toggle") ? 503 : 202 }))
+  eq(mixed.status, 202); eq(queued.map((x) => x.payload.id), ["reg-link-regenerate"])
+})
+
+Deno.test("다시 넘기기 큐에도 못 넣으면 502(최후의 수단)", async () => {
+  eq((await handleRouter(req({}, { "x-hada-action": "reg-report-sync" }), deps({ status: 500, enqueueThrows: true }))).status, 502)
+})
+
+Deno.test("워커 다시 넘기기: 지금 서버 키로 본문 그대로, 실패면 throw(큐가 재시도)", async () => {
+  const calls: any[] = []
+  const mk = (st: number) => ({
+    fetch: (async (url: string, init: RequestInit) => { calls.push({ url, init }); if (st === 0) throw new Error("net"); return new Response("{}", { status: st }) }) as any,
+    baseUrl: () => "https://x.supabase.co",
+    key: async () => "server-key",
+  })
+  await processRouterRetryItem({ id: "reg-textbook-queue", pageId: "p", body: '{"data":{"id":"p"}}' }, undefined, mk(202))
+  eq(calls[0].url, "https://x.supabase.co/functions/v1/sync-registration-textbook/queue")
+  eq(calls[0].init.body, '{"data":{"id":"p"}}')
+  eq((calls[0].init.headers as Record<string, string>)["x-admin-key"], "server-key")
+  await processRouterRetryItem({ id: "reg-textbook-queue", body: "{}" }, undefined, mk(409)) // 4xx는 함수 판단 → 끝
+  for (const st of [500, 0]) {
+    let threw = false
+    try { await processRouterRetryItem({ id: "reg-textbook-queue", body: "{}" }, undefined, mk(st)) } catch { threw = true }
+    assert(threw, `retry should throw on ${st}`)
+  }
+  let threw = false
+  try { await processRouterRetryItem({ id: "nope", body: "{}" }, undefined, mk(202)) } catch { threw = true }
+  assert(threw, "unknown id throws")
 })
 
 Deno.test("GET은 405", async () => {
