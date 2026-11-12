@@ -7,10 +7,13 @@
 // 동작 이름은 관리자 설정 웹훅 체크리스트(admin_settings.js CHECKLIST)의 항목 ID와 같다. 두 목록이 어긋나지 않게
 // webhookRoutes_test.ts가 CHECKLIST의 ID·함수·경로와 이 표를 비교한다.
 //
-// 동작을 알아내는 곳(둘 다 있으면 합친다):
-//   1. 헤더 x-hada-action: "reg-link-regenerate" 처럼 항목 ID 하나(쉼표로 여러 개도 됨). 버튼 웹훅과 값 편집 자동화가 쓴다.
-//   2. 본문의 수식 속성 `웹훅 정보`: {"wait":["reg-textbook-queue", ...]} — DB마다 하나, 지금 ⚪ 대기인 상태의 항목 ID 목록.
-//      DB마다 자동화 하나(트리거: 상태 칸들 중 하나라도 ⚪ 대기)가 같은 주소로 보낼 때 쓴다.
+// 동작을 알아내는 곳(여럿 있으면 합친다):
+//   1. 헤더 x-hada-action: "reg-link-regenerate" 처럼 항목 ID 하나(쉼표로 여러 개도 됨). 주소 끝 ?a= 도 같다.
+//      다른 워크스페이스로 복제하면 헤더 값이 비어 새 학원마다 다시 넣어야 한다.
+//   2. 본문에서 이름이 "웹훅"으로 시작하는 칸(수식·select·텍스트). 복제해도 남는다(261112 설계: 과제 폴더 웹훅-수식-설계).
+//      - `웹훅 버튼`(select): 버튼이 웹훅 바로 앞 단계에서 자기 항목 ID로 바꾼다. 버튼만 이 칸을 보낸다.
+//      - `웹훅 정보`(수식): 지금 ⚪ 대기인 상태·삭제 체크의 항목 ID 목록(쉼표 또는 {"wait":[...]}). 상태 자동화가 보낸다.
+//      - 그 밖 `웹훅 …` 수식: 한 자동화만 보내는 조건·상수(예: `웹훅 링크`).
 
 export type WebhookRoute = {
   id: string
@@ -79,13 +82,37 @@ export function routeById(id: string): WebhookRoute | undefined {
   return BY_ID.get(id)
 }
 
-// 수식 속성 값(문자열)을 꺼낸다. Notion 자동화 본문 `data.properties[이름].formula.string` 모양.
-function formulaString(body: any, prop: string): string {
-  const p = body?.data?.properties?.[prop] ?? body?.properties?.[prop]
-  const f = p?.formula
-  if (f && typeof f.string === "string") return f.string
+// (261112) 동작을 담는 칸: 이름이 "웹훅"으로 시작하는 본문 속성 전부(`웹훅 정보` 수식, `웹훅 버튼` select, `웹훅 링크` 등).
+// 다른 워크스페이스로 템플릿 복제하면 웹훅 주소·헤더 값(키·x-hada-action)은 비지만 수식·select·버튼 편집 단계·보낼 속성은
+// 남는다(원본→비아 시험). 그래서 동작을 칸에 담아 두면 새 학원은 45곳에 같은 주소와 키만 넣으면 된다.
+export const WEBHOOK_PROP_PREFIX = "웹훅"
+
+// 속성 값 하나를 문자열로. formula.string · select.name · rich_text/title의 plain_text · 그냥 문자열.
+function propText(p: any): string {
   if (typeof p === "string") return p
+  if (!p || typeof p !== "object") return ""
+  if (p.formula && typeof p.formula.string === "string") return p.formula.string
+  if (p.select && typeof p.select.name === "string") return p.select.name
+  const rich = Array.isArray(p.rich_text) ? p.rich_text : Array.isArray(p.title) ? p.title : null
+  if (rich) return rich.map((t: any) => t?.plain_text ?? t?.text?.content ?? "").join("")
   return ""
+}
+
+// 칸 값 → 동작 ID 목록. JSON {"wait":[...]} / {"wait":"a,b"} 또는 쉼표로 이은 문자열.
+function idsFromText(text: string): string[] {
+  const s = text.trim()
+  if (!s) return []
+  const split = (v: string) => v.split(",").map((x) => x.trim()).filter(Boolean)
+  try {
+    const parsed = JSON.parse(s)
+    const wait = parsed?.wait
+    if (Array.isArray(wait)) return wait.map((x: unknown) => String(x).trim()).filter(Boolean)
+    if (typeof wait === "string") return split(wait)
+    if (typeof parsed === "string") return split(parsed)
+    return []
+  } catch {
+    return split(s)
+  }
 }
 
 // 요청에서 동작 ID 목록을 뽑는다. 모르는 ID는 unknown으로 따로 돌려준다(기록만 하고 무시).
@@ -93,15 +120,11 @@ export function resolveActions(headers: Headers, body: unknown): { ids: string[]
   const raw: string[] = []
   const h = headers.get(ACTION_HEADER)
   if (h) raw.push(...h.split(",").map((s) => s.trim()).filter(Boolean))
-  const info = formulaString(body, WEBHOOK_INFO_PROP)
-  if (info) {
-    try {
-      const parsed = JSON.parse(info)
-      const wait = parsed?.wait
-      if (Array.isArray(wait)) raw.push(...wait.map((x: unknown) => String(x).trim()).filter(Boolean))
-      else if (typeof wait === "string" && wait.trim()) raw.push(...wait.split(",").map((s) => s.trim()).filter(Boolean))
-    } catch {
-      raw.push(...info.split(",").map((s) => s.trim()).filter(Boolean))
+  const b = body as any
+  const props = b?.data?.properties ?? b?.properties
+  if (props && typeof props === "object") {
+    for (const [name, p] of Object.entries(props)) {
+      if (name.startsWith(WEBHOOK_PROP_PREFIX)) raw.push(...idsFromText(propText(p)))
     }
   }
   const ids: string[] = [], unknown: string[] = []

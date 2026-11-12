@@ -27,6 +27,28 @@ Deno.test("동작 ID: 헤더·수식(wait 배열·문자열)·중복·모르는 
   eq(resolveActions(new Headers(), {}).ids, [])
 })
 
+Deno.test("동작 ID: 이름이 '웹훅'으로 시작하는 칸(버튼 select·수식 쉼표·조건 수식·텍스트), 다른 칸은 무시", () => {
+  // 버튼: select `웹훅 버튼` + 함께 보내는 칸(담기 계획)은 무시
+  const btn = { data: { id: "p", properties: {
+    "담기 계획": { type: "formula", formula: { type: "string", string: "cart-notice" } },
+    "웹훅 버튼": { type: "select", select: { name: "cart-progress-book" } },
+  } } }
+  eq(resolveActions(new Headers(), btn), { ids: ["cart-progress-book"], unknown: [] })
+  // 상태 자동화: 수식 `웹훅 정보` 쉼표 목록(교재비 원본 시험 모양)
+  const auto = { data: { properties: { "실행자": { people: [] }, "웹훅 정보": { formula: { string: "cart-notice,cart-delete" } } } } }
+  eq(resolveActions(new Headers(), auto).ids, ["cart-notice", "cart-delete"])
+  // 빈 수식·빈 select는 동작 없음
+  eq(resolveActions(new Headers(), { data: { properties: { "웹훅 정보": { formula: { string: "" } }, "웹훅 버튼": { select: null } } } }).ids, [])
+  // 조건 수식 `웹훅 링크`, 텍스트 칸
+  eq(resolveActions(new Headers(), { data: { properties: { "웹훅 링크": { formula: { string: "reg-link-disable" } } } } }).ids, ["reg-link-disable"])
+  eq(resolveActions(new Headers(), { data: { properties: { "웹훅 메모": { rich_text: [{ plain_text: "school-calendar" }] } } } }).ids, ["school-calendar"])
+  // 헤더와 칸이 같으면 한 번만, 칸의 모르는 ID는 unknown
+  const both = resolveActions(new Headers({ "x-hada-action": "cart-notice" }), { data: { properties: { "웹훅 정보": { formula: { string: "cart-notice, oops" } } } } })
+  eq(both, { ids: ["cart-notice"], unknown: ["oops"] })
+  // "웹훅"으로 시작하지 않는 칸에 ID가 있어도 무시
+  eq(resolveActions(new Headers(), { data: { properties: { "정보 웹훅": { formula: { string: "cart-notice" } } } } }).ids, [])
+})
+
 Deno.test("주소: 경로·쿼리 붙이기", () => {
   eq(targetUrl("https://x.supabase.co/", routeById("reg-link-regenerate")!), "https://x.supabase.co/functions/v1/toggle-report-link?action=regenerate")
   eq(targetUrl("https://x.supabase.co", routeById("cart-progress-book")!), "https://x.supabase.co/functions/v1/sync-textbook-distribution/from-cart/queue")
