@@ -11,7 +11,7 @@
 // (261112 원본 실시험) Notion은 웹훅이 400·401·5xx를 받으면 그 자동화를 통째로 "일시 중지"한다(받은편지함 알림에
 // 이유·상태 코드 없음, 그 DB의 다른 행도 더는 안 감). 그래서 Notion에는 될 수 있는 한 2xx로 답하고, 실패는 서버가
 // 스스로 처리한다.
-// - 동작 ID를 못 찾음(헤더·?a=·수식 모두 없음/모르는 ID): 200으로 답하고 sync_queue에 실패 한 줄
+// - 동작 ID를 못 찾음("웹훅…" 칸·헤더·?a= 모두 없음/모르는 ID): 200으로 답하고 sync_queue에 실패 한 줄
 //   (target "notion-router")을 남긴다 → sync-failure-audit가 30분마다 자동화 로그 DB에 보고. 다시 해도 같은
 //   결과라 재시도는 하지 않는다.
 // - 넘기기 실패(네트워크·5xx·25초 초과): 그 동작만 sync_queue에 "다시 넘기기"(target "notion-router-retry")로
@@ -92,15 +92,15 @@ export async function handleRouter(req: Request, deps: RouterDeps = defaultRoute
   if (unknown.length || !ids.length) {
     // 본문(학생 정보가 들어 있을 수 있음)은 남기지 않는다. 어느 자동화·페이지에서 왔는지만.
     const message = ids.length
-      ? `모르는 동작 ID ${unknown.join(", ")} (나머지는 넘김) — 버튼·자동화의 x-hada-action 값을 확인하세요`
-      : `동작을 찾지 못했습니다${unknown.length ? `(모르는 ID ${unknown.join(", ")})` : ""} — 버튼·자동화에 x-hada-action 헤더나 ?a=동작ID를 넣으세요`
+      ? `모르는 동작 ID ${unknown.join(", ")} (나머지는 넘김) — 버튼의 "웹훅 버튼" 단계·보낼 속성, 자동화의 "웹훅 정보" 수식을 확인하세요`
+      : `동작을 찾지 못했습니다${unknown.length ? `(모르는 ID ${unknown.join(", ")})` : ""} — 버튼은 웹훅 앞에 "웹훅 버튼 = 항목 ID" 단계와 보낼 속성 "웹훅 버튼", 자동화는 보낼 속성에 "웹훅 정보"(등) 수식이 있는지 확인하세요`
     deps.log(ids.length ? "모르는 동작(무시)" : "동작 없음", { unknown, pageId, automationId })
     await deps.recordFailure(ROUTER_MISS_TARGET, { pageId, automationId, unknown }, message)
       .catch((err) => deps.log("실패 기록 못 남김", { error: (err as Error).message }))
   }
   if (!ids.length) {
     // 200: 4xx로 답하면 Notion이 이 자동화를 멈춘다. 무엇이 잘못됐는지는 자동화 로그 DB에 남는다.
-    return json({ ok: false, error: "동작을 찾지 못했습니다(x-hada-action 헤더·?a=·웹훅 정보 수식)", unknown }, 200)
+    return json({ ok: false, error: "동작을 찾지 못했습니다(웹훅 버튼·웹훅 정보 칸 또는 x-hada-action 헤더)", unknown }, 200)
   }
 
   const base = deps.baseUrl()

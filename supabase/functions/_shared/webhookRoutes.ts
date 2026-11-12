@@ -5,15 +5,15 @@
 // Notion을 읽지 않고, 기존 함수의 잠금·상태·큐 처리를 건드리지 않는다.
 //
 // 동작 이름은 관리자 설정 웹훅 체크리스트(admin_settings.js CHECKLIST)의 항목 ID와 같다. 두 목록이 어긋나지 않게
-// webhookRoutes_test.ts가 CHECKLIST의 ID·함수·경로와 이 표를 비교한다.
+// webhookRouter_test.ts가 CHECKLIST의 ID·함수·경로와 이 표를 비교한다.
 //
 // 동작을 알아내는 곳(여럿 있으면 합친다):
-//   1. 헤더 x-hada-action: "reg-link-regenerate" 처럼 항목 ID 하나(쉼표로 여러 개도 됨). 주소 끝 ?a= 도 같다.
-//      다른 워크스페이스로 복제하면 헤더 값이 비어 새 학원마다 다시 넣어야 한다.
-//   2. 본문에서 이름이 "웹훅"으로 시작하는 칸(수식·select·텍스트). 복제해도 남는다(261112 설계: 과제 폴더 웹훅-수식-설계).
+//   1. 본문에서 이름이 "웹훅"으로 시작하는 칸(수식·select·텍스트) — 원본 45곳이 쓰는 방법. 템플릿 복제해도 남아,
+//      새 학원은 45곳에 같은 주소·키만 넣는다(칸 원문: docs/updates/v2.8-노션-작업.md 부록 "웹훅 칸").
 //      - `웹훅 버튼`(select): 버튼이 웹훅 바로 앞 단계에서 자기 항목 ID로 바꾼다. 버튼만 이 칸을 보낸다.
-//      - `웹훅 정보`(수식): 지금 ⚪ 대기인 상태·삭제 체크의 항목 ID 목록(쉼표 또는 {"wait":[...]}). 상태 자동화가 보낸다.
-//      - 그 밖 `웹훅 …` 수식: 한 자동화만 보내는 조건·상수(예: `웹훅 링크`).
+//      - `웹훅 정보`(수식): 지금 ⚪ 대기인 상태·삭제 체크의 항목 ID 목록(쉼표 또는 {"wait":[...]}), 또는 상수.
+//      - 그 밖 `웹훅 …` 수식: 한 자동화만 보내는 조건·상수(`웹훅 링크`, `웹훅 수업일시`).
+//   2. 헤더 x-hada-action(쉼표로 여러 개)·주소 끝 ?a= — 예전 연결용으로 계속 받는다(복제하면 값이 빈다).
 
 export type WebhookRoute = {
   id: string
@@ -24,7 +24,6 @@ export type WebhookRoute = {
   path: string
 }
 
-export const WEBHOOK_INFO_PROP = "웹훅 정보"
 export const ACTION_HEADER = "x-hada-action"
 
 // admin_settings.js CHECKLIST에서 그대로 옮긴 표(순서·ID·함수·경로 같음).
